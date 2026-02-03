@@ -72,8 +72,8 @@ class TestGroupedGemmUpKernel:
         torch.testing.assert_close(
             triton_down,
             ref["x_after_down"],
-            rtol=1e-2,
-            atol=1e-2,
+            rtol=1.6e-2,
+            atol=1e-5,
         )
 
     def test_grouped_gemm_up_uniform_experts(self, reference_moe_uniform, test_input_medium):
@@ -105,8 +105,8 @@ class TestGroupedGemmUpKernel:
         torch.testing.assert_close(
             triton_down,
             ref["x_after_down"],
-            rtol=1e-2,
-            atol=1e-2,
+            rtol=1.6e-2,
+            atol=1e-5,
         )
 
     def test_grouped_gemm_up_variable_experts(self, reference_moe_variable, test_input_medium):
@@ -138,8 +138,8 @@ class TestGroupedGemmUpKernel:
         torch.testing.assert_close(
             triton_down,
             ref["x_after_down"],
-            rtol=1e-2,
-            atol=1e-2,
+            rtol=1.6e-2,
+            atol=1e-5,
         )
 
 
@@ -180,8 +180,8 @@ class TestGroupedGemmDownKernel:
         torch.testing.assert_close(
             triton_down,
             ref["x_after_down"],
-            rtol=1e-2,
-            atol=1e-2,
+            rtol=1.6e-2,
+            atol=1e-5,
         )
 
     def test_grouped_gemm_down_uniform_experts(self, reference_moe_uniform, test_input_medium):
@@ -213,8 +213,8 @@ class TestGroupedGemmDownKernel:
         torch.testing.assert_close(
             triton_down,
             ref["x_after_down"],
-            rtol=1e-2,
-            atol=1e-2,
+            rtol=1.6e-2,
+            atol=1e-5,
         )
 
     def test_grouped_gemm_down_variable_experts(self, reference_moe_variable, test_input_medium):
@@ -246,8 +246,8 @@ class TestGroupedGemmDownKernel:
         torch.testing.assert_close(
             triton_down,
             ref["x_after_down"],
-            rtol=1e-2,
-            atol=1e-2,
+            rtol=1.6e-2,
+            atol=1e-5,
         )
 
 

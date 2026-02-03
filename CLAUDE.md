@@ -87,10 +87,10 @@ def test_grouped_gemm_up_matches_reference(reference_moe_small, test_input_small
     triton_up = grouped_gemm_up(...)
     triton_down = grouped_gemm_down(triton_up, ...)
 
-    torch.testing.assert_close(triton_down, ref["x_after_down"], rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(triton_down, ref["x_after_down"], rtol=1.6e-2, atol=1e-5)
 ```
 
-Tolerances are relaxed (1e-2) due to bfloat16 precision and different computation order.
+Tolerances use rtol=1.6e-2 (~1.6%) for bfloat16 precision and atol=1e-5 for small values.
 
 ## Current Implementation Status
 

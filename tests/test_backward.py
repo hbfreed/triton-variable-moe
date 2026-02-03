@@ -65,8 +65,8 @@ class TestBackwardPass:
         torch.testing.assert_close(
             triton_grad,
             ref_grad,
-            rtol=1e-2,
-            atol=1e-2,
+            rtol=1.6e-2,
+            atol=1e-5,
         )
 
     def test_weight_gradient_matches_reference(self, reference_moe_small, test_input_small):
@@ -103,15 +103,15 @@ class TestBackwardPass:
         torch.testing.assert_close(
             triton_moe.w1.grad,
             ref_w1_grad,
-            rtol=1e-2,
-            atol=1e-2,
+            rtol=1.6e-2,
+            atol=1e-5,
             msg="W1 gradient mismatch",
         )
         torch.testing.assert_close(
             triton_moe.w2.grad,
             ref_w2_grad,
-            rtol=1e-2,
-            atol=1e-2,
+            rtol=1.6e-2,
+            atol=1e-5,
             msg="W2 gradient mismatch",
         )
 
@@ -169,8 +169,8 @@ class TestBackwardPass:
         torch.testing.assert_close(
             x_triton.grad,
             ref_grad,
-            rtol=1e-2,
-            atol=1e-2,
+            rtol=1.6e-2,
+            atol=1e-5,
         )
 
 

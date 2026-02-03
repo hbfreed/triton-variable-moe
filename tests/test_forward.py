@@ -34,8 +34,8 @@ class TestForwardPass:
         torch.testing.assert_close(
             triton_output,
             ref_output,
-            rtol=1e-2,
-            atol=1e-2,
+            rtol=1.6e-2,
+            atol=1e-5,
         )
 
     def test_forward_matches_reference_uniform(self, reference_moe_uniform, test_input_medium):
@@ -61,8 +61,8 @@ class TestForwardPass:
         torch.testing.assert_close(
             triton_output,
             ref_output,
-            rtol=1e-2,
-            atol=1e-2,
+            rtol=1.6e-2,
+            atol=1e-5,
         )
 
     def test_forward_matches_reference_variable(self, reference_moe_variable, test_input_medium):
@@ -88,8 +88,8 @@ class TestForwardPass:
         torch.testing.assert_close(
             triton_output,
             ref_output,
-            rtol=1e-2,
-            atol=1e-2,
+            rtol=1.6e-2,
+            atol=1e-5,
         )
 
     def test_forward_deterministic(self, reference_moe_small, test_input_small):
@@ -175,7 +175,7 @@ class TestForwardWithIntermediates:
                 torch.testing.assert_close(
                     triton_intermediates[key],
                     ref[key],
-                    rtol=1e-2,
-                    atol=1e-2,
+                    rtol=1.6e-2,
+                    atol=1e-5,
                     msg=f"Mismatch in {key}",
                 )

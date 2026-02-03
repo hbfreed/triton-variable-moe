@@ -143,7 +143,7 @@ def reference_forward(moe: MoEMLP, x: torch.Tensor) -> torch.Tensor:
     return output
 
 
-def verify_correctness(moe: MoEMLP, x: torch.Tensor, rtol: float = 1e-2, atol: float = 1e-2) -> bool:
+def verify_correctness(moe: MoEMLP, x: torch.Tensor, rtol: float = 1.6e-2, atol: float = 1e-5) -> bool:
     """Verify that Triton forward matches reference forward."""
     with torch.no_grad():
         # Suppress reference output print statements
@@ -303,7 +303,7 @@ def print_results(results: list[dict]):
     print("  - Reference: Full MoE forward with topology construction + stk.ops.sdd/dsd")
     print("  - Triton: MoE forward with grouped_gemm_up/down (no topology)")
     print("  - Speedup = Reference / Triton")
-    print("  - Correctness verified with rtol=1e-2, atol=1e-2 (bfloat16 precision)")
+    print("  - Correctness verified with rtol=1.6e-2, atol=1e-5 (bfloat16 precision)")
 
 
 def main():

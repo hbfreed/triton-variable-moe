@@ -1,0 +1,32 @@
+[project]
+name = "triton-variable-moe"
+version = "0.1.0"
+description = "Triton-based MoE kernels with variable-sized expert support"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "torch>=2.0.0,<2.10",
+    "triton",
+    "einops",
+    "megablocks[all] @ git+https://github.com/hbfreed/megablocks-variable",
+    "stanford-stk",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["reference", "triton_moe"]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-benchmark",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

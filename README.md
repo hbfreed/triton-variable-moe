@@ -138,6 +138,28 @@ output = grouped_gemm(x, W, expert_offsets, expert_widths)  # no topology
 
 **Expected speedup:** ~1.6x just from eliminating topology overhead, before any kernel optimizations.
 
+## Results: Triton vs Reference (February 3, 2025)
+
+Full MoE forward pass benchmark comparing reference (stk/megablocks) vs Triton implementation:
+
+**Setup:** RTX 3090, CUDA 12.8, batch=8, seq_len=512, hidden=256
+
+| Config | Reference | Triton | Speedup |
+|--------|-----------|--------|---------|
+| 8_uniform | 4.05 ms | 1.87 ms | **2.16x** |
+| 8_variable | 3.10 ms | 1.78 ms | **1.74x** |
+| 64_uniform | 3.85 ms | 1.21 ms | **3.18x** |
+| 64_variable | 3.91 ms | 1.22 ms | **3.19x** |
+| 128_uniform | 3.08 ms | 2.03 ms | **1.52x** |
+| 128_variable | 3.21 ms | 2.11 ms | **1.52x** |
+
+Consistent 1.5-3.2x speedups across all configurations by eliminating topology construction overhead.
+
+```bash
+# Run the full forward benchmark
+CUDA_VISIBLE_DEVICES=1 uv run python benchmarks/bench_forward.py
+```
+
 ### Run Benchmarks
 
 ```bash

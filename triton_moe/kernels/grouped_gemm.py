@@ -499,6 +499,7 @@ def grouped_gemm_down(
 
 @triton.autotune(
     configs=[
+        # BLOCK_K=32 variants
         triton.Config(
             {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4
         ),
@@ -510,6 +511,29 @@ def grouped_gemm_down(
         ),
         triton.Config(
             {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4
+        ),
+        # BLOCK_K=64 variants
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=4
+        ),
+        # Higher warp counts for larger tiles
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=8
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=8
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=8
         ),
     ],
     key=["hidden_size", "num_experts"],
@@ -635,6 +659,7 @@ def _grouped_gemm_up_backward_dx_kernel(
 
 @triton.autotune(
     configs=[
+        # BLOCK_K=32 variants
         triton.Config(
             {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4
         ),
@@ -646,6 +671,29 @@ def _grouped_gemm_up_backward_dx_kernel(
         ),
         triton.Config(
             {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4
+        ),
+        # BLOCK_K=64 variants
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=4
+        ),
+        # Higher warp counts for larger tiles
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=8
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=8
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=8
         ),
     ],
     key=["hidden_size", "num_experts"],
@@ -770,6 +818,7 @@ def _grouped_gemm_up_backward_dw_kernel(
 
 @triton.autotune(
     configs=[
+        # BLOCK_K=32 variants
         triton.Config(
             {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4
         ),
@@ -781,6 +830,29 @@ def _grouped_gemm_up_backward_dw_kernel(
         ),
         triton.Config(
             {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4
+        ),
+        # BLOCK_K=64 variants
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=4
+        ),
+        # Higher warp counts for larger tiles
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=8
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=8
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=8
         ),
     ],
     key=["hidden_size", "num_experts"],
@@ -878,6 +950,7 @@ def _grouped_gemm_down_backward_dintermediate_kernel(
 
 @triton.autotune(
     configs=[
+        # BLOCK_K=32 variants
         triton.Config(
             {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4
         ),
@@ -889,6 +962,29 @@ def _grouped_gemm_down_backward_dintermediate_kernel(
         ),
         triton.Config(
             {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4
+        ),
+        # BLOCK_K=64 variants
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=4
+        ),
+        # Higher warp counts for larger tiles
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=8
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=8
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=8
         ),
     ],
     key=["hidden_size", "num_experts"],

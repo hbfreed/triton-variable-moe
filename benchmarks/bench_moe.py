@@ -155,6 +155,137 @@ def benchmark_forward_profiled(
     return agg
 
 
+def _categorize_backward_op(op_name: str) -> str | None:
+    """Categorize a backward operation into a meaningful group.
+
+    Returns None for ops we want to skip (overhead, etc.)
+    """
+    name_lower = op_name.lower()
+
+    # Scatter/Gather backward (triton kernels from megablocks)
+    if "_padded_copy_wgrad" in name_lower:
+        return "scatter_wgrad"
+    if "_padded_copy" in name_lower and "wgrad" not in name_lower:
+        return "gather_bwd"
+
+    # GEMM backward (stk kernels)
+    if "_dsd_kernel" in name_lower:
+        return "dsd_bwd"
+    if "_sdd_kernel" in name_lower:
+        return "sdd_bwd"
+    if "_dds_kernel" in name_lower:
+        return "dds_bwd"
+
+    # The massive fill operation (zeroing tensors in scatter backward)
+    if "fillfunctor" in name_lower:
+        return "zero_fill"
+
+    # Activation backward (threshold = relu backward)
+    if "threshold" in name_lower:
+        return "activation_bwd"
+
+    # Routing backward
+    if "sigmoid_backward" in name_lower:
+        return "routing_bwd"
+
+    # GEMM kernels (cutlass/cublas for router backward)
+    if "cutlass" in name_lower or "cublas" in name_lower:
+        return "gemm_bwd"
+
+    # Reduce operations (for sum backward)
+    if "reduce_kernel" in name_lower:
+        return "reduce"
+
+    # Element-wise ops (mul, add, div, neg)
+    if "mulfunctor" in name_lower or "addfunctor" in name_lower:
+        return "elementwise"
+    if "divfunctor" in name_lower or "neg_kernel" in name_lower:
+        return "elementwise"
+
+    # Memory operations
+    if "memcpy" in name_lower or "memset" in name_lower:
+        return "memory"
+
+    # Skip other low-level ops
+    return None
+
+
+def benchmark_backward_profiled(
+    model: MoEMLP,
+    x: torch.Tensor,
+    num_warmup: int,
+    num_runs: int,
+) -> dict[str, dict[str, float]]:
+    """Benchmark backward pass with per-step profiling using torch.profiler.
+
+    Returns:
+        Dictionary with 'mean' and 'std' sub-dicts mapping step names to times in ms,
+        plus 'wall_clock_mean' and 'wall_clock_std' for total wall-clock time.
+    """
+    import time
+    from collections import defaultdict
+
+    # Warmup
+    for _ in range(num_warmup):
+        model.zero_grad()
+        x_clone = x.clone().requires_grad_(True)
+        out, _, _ = model(x_clone)
+        out.sum().backward()
+
+    torch.cuda.synchronize()
+
+    # Collect timing data
+    all_step_times: dict[str, list[float]] = defaultdict(list)
+    wall_clock_times: list[float] = []
+
+    for _ in range(num_runs):
+        model.zero_grad()
+        x_clone = x.clone().requires_grad_(True)
+
+        # Forward pass (not profiled here)
+        out, _, _ = model(x_clone)
+
+        torch.cuda.synchronize()
+
+        # Profile backward with wall-clock timing
+        start_time = time.perf_counter()
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA],
+        ) as prof:
+            out.sum().backward()
+        torch.cuda.synchronize()
+        wall_clock_times.append((time.perf_counter() - start_time) * 1000)
+
+        # Categorize and aggregate CUDA times
+        step_times: dict[str, float] = defaultdict(float)
+        for event in prof.key_averages():
+            category = _categorize_backward_op(event.key)
+            if category and event.device_time_total > 0:
+                step_times[category] += event.device_time_total / 1000  # Convert to ms
+
+        for name, time_ms in step_times.items():
+            all_step_times[name].append(time_ms)
+
+    # Compute mean and std
+    means = {name: sum(times) / len(times) for name, times in all_step_times.items()}
+    stds = {}
+    for name, times in all_step_times.items():
+        mean = means[name]
+        variance = sum((t - mean) ** 2 for t in times) / len(times)
+        stds[name] = variance ** 0.5
+
+    wall_mean = sum(wall_clock_times) / len(wall_clock_times)
+    wall_std = (sum((t - wall_mean) ** 2 for t in wall_clock_times) / len(wall_clock_times)) ** 0.5
+
+    return {
+        "mean": means,
+        "std": stds,
+        "num_runs": num_runs,
+        "wall_clock_mean": wall_mean,
+        "wall_clock_std": wall_std,
+    }
+
+
 def run_benchmark(config: BenchmarkConfig) -> dict:
     """Run benchmarks for a given configuration."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -238,8 +369,12 @@ def run_benchmark(config: BenchmarkConfig) -> dict:
     return results
 
 
-def run_profiled_benchmark(config: BenchmarkConfig) -> AggregateProfiler:
-    """Run profiled benchmark for a given configuration."""
+def run_profiled_benchmark(config: BenchmarkConfig) -> tuple[AggregateProfiler, dict]:
+    """Run profiled benchmark for a given configuration.
+
+    Returns:
+        Tuple of (forward_profiler, backward_profile_dict)
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
         raise RuntimeError("CUDA is required for profiled benchmarks")
@@ -263,10 +398,48 @@ def run_profiled_benchmark(config: BenchmarkConfig) -> AggregateProfiler:
         dtype=torch.bfloat16,
     )
 
-    # Run profiled benchmark
-    return benchmark_forward_profiled(
+    # Run profiled benchmarks
+    fwd_profiler = benchmark_forward_profiled(
         ref_model, x, config.num_warmup, config.num_runs
     )
+    bwd_profile = benchmark_backward_profiled(
+        ref_model, x, config.num_warmup, config.num_runs
+    )
+
+    return fwd_profiler, bwd_profile
+
+
+def print_backward_profile(bwd_profile: dict, indent: str = "  "):
+    """Print backward profiling results."""
+    means = bwd_profile["mean"]
+    stds = bwd_profile["std"]
+    num_runs = bwd_profile["num_runs"]
+    wall_mean = bwd_profile.get("wall_clock_mean", 0)
+    wall_std = bwd_profile.get("wall_clock_std", 0)
+
+    if not means:
+        print(f"{indent}No backward profiling data")
+        return
+
+    cuda_total = sum(means.values())
+
+    # Sort by time (descending)
+    sorted_steps = sorted(means.items(), key=lambda x: x[1], reverse=True)
+
+    print(f"{indent}Backward Profiling ({num_runs} runs):")
+    print(f"{indent}{'-' * 55}")
+    for name, mean_time in sorted_steps:
+        std_time = stds.get(name, 0)
+        pct = (mean_time / cuda_total * 100) if cuda_total > 0 else 0
+        print(f"{indent}  {name:<22} {mean_time:>7.3f} +/- {std_time:>6.3f} ms ({pct:>5.1f}%)")
+    print(f"{indent}{'-' * 55}")
+    cuda_std = (sum(s ** 2 for s in stds.values())) ** 0.5
+    print(f"{indent}  {'CUDA TOTAL':<22} {cuda_total:>7.3f} +/- {cuda_std:>6.3f} ms")
+    print(f"{indent}  {'WALL CLOCK':<22} {wall_mean:>7.3f} +/- {wall_std:>6.3f} ms")
+    if wall_mean > 0:
+        overhead = wall_mean - cuda_total
+        overhead_pct = (overhead / wall_mean) * 100
+        print(f"{indent}  {'OVERHEAD':<22} {overhead:>7.3f} ms ({overhead_pct:.1f}% of wall clock)")
 
 
 def print_results(results: list[dict]):
@@ -473,8 +646,10 @@ def main():
 
         for config in configs:
             print(f"\n{config.name} (batch={config.batch_size}, seq={config.seq_len}, embd={config.n_embd}):")
-            agg = run_profiled_benchmark(config)
-            agg.print_summary()
+            fwd_agg, bwd_profile = run_profiled_benchmark(config)
+            fwd_agg.print_summary()
+            print()
+            print_backward_profile(bwd_profile)
     else:
         # Run standard benchmarks
         results = []

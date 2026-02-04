@@ -143,6 +143,7 @@ class TritonMoEMLP(nn.Module):
                 "valid_expert_indices", torch.empty(0, dtype=torch.long), persistent=False
             )
 
+    @torch.compiler.disable
     def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None, torch.Tensor | None]:

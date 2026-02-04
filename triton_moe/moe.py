@@ -94,6 +94,55 @@ class TritonMoEMLP(nn.Module):
             persistent=False,
         )
 
+        # For aux loss computation
+        # Normalized expert widths for compute loss (proportional to FLOPs)
+        mean_expert_width = sum(self.expert_widths) / self.num_experts
+        self.register_buffer(
+            "expert_widths_normalized",
+            torch.tensor(
+                [w / mean_expert_width for w in self.expert_widths], dtype=torch.float32
+            ),
+            persistent=False,
+        )
+
+        # Group membership for variable expert load balance loss
+        expert_to_group = []
+        group_sizes = []
+        valid_group_idx = 0
+        for count, size in config.expert_sizes:
+            for _ in range(count):
+                if count > 1:
+                    expert_to_group.append(valid_group_idx)
+                else:
+                    expert_to_group.append(-1)
+            if count > 1:
+                group_sizes.append(count)
+                valid_group_idx += 1
+
+        self._num_valid_groups = len(group_sizes)
+        self._all_experts_valid = all(g >= 0 for g in expert_to_group)
+
+        if self._num_valid_groups > 0:
+            group_membership = torch.zeros(self.num_experts, self._num_valid_groups)
+            for i, g in enumerate(expert_to_group):
+                if g >= 0:
+                    group_membership[i, g] = 1.0
+
+            self.register_buffer("group_membership", group_membership, persistent=False)
+            self.register_buffer(
+                "group_sizes", torch.tensor(group_sizes, dtype=torch.float32), persistent=False
+            )
+            valid_indices = [i for i, g in enumerate(expert_to_group) if g >= 0]
+            self.register_buffer(
+                "valid_expert_indices", torch.tensor(valid_indices, dtype=torch.long), persistent=False
+            )
+        else:
+            self.register_buffer("group_membership", torch.empty(0), persistent=False)
+            self.register_buffer("group_sizes", torch.tensor([1.0]), persistent=False)
+            self.register_buffer(
+                "valid_expert_indices", torch.empty(0, dtype=torch.long), persistent=False
+            )
+
     def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None, torch.Tensor | None]:
@@ -104,8 +153,8 @@ class TritonMoEMLP(nn.Module):
 
         Returns:
             output: Output tensor of shape [batch_size, seq_len, n_embd]
-            aux_loss: None (not implemented yet)
-            router_probs: None (not implemented yet)
+            aux_loss: Dictionary containing router_z_loss, load_balance_loss, compute_loss
+            f_i: Expert usage fractions tensor
         """
         batch_size, seq_len, n_embd = x.shape
         device = x.device
@@ -192,7 +241,57 @@ class TritonMoEMLP(nn.Module):
 
         output = rearrange(output_flat, "(b s) d -> b s d", b=batch_size)
 
-        return output, None, None
+        # 8. Compute auxiliary losses
+        # Router z-loss: keeps router logits small
+        router_z_loss = torch.logsumexp(router_logits, dim=-1).pow(2).mean()
+
+        # Expert usage fractions (f_i)
+        f_i = (tokens_per_expert.float() / tokens_per_expert.sum()).to(x.dtype)
+
+        # Load balance loss
+        load_balance_loss = self._compute_load_balance_loss(router_probs, f_i)
+
+        # Compute loss: weighted sum of normalized expert widths (proportional to FLOPs)
+        compute_loss = (
+            router_probs @ self.expert_widths_normalized.to(router_probs.dtype)
+        ).mean()
+
+        aux_loss = {
+            "router_z_loss": router_z_loss,
+            "load_balance_loss": load_balance_loss,
+            "compute_loss": compute_loss,
+        }
+
+        return output, aux_loss, f_i
+
+    def _compute_load_balance_loss(
+        self, router_probs: torch.Tensor, f_i: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute load balance loss within expert groups (vectorized)."""
+        p_i = router_probs.mean(dim=0)
+
+        # Fast path for uniform expert sizes
+        if len(set(self.expert_widths)) == 1:
+            return self.num_experts * (f_i.float() @ p_i.float())
+
+        # Fast path if no valid groups
+        if self._num_valid_groups == 0:
+            return f_i.float() @ p_i.float()
+
+        # Compute f_i * p_i elementwise
+        fi_pi = f_i.float() * p_i.float()
+
+        # If all experts are in valid groups, skip masking
+        membership = self.group_membership.to(fi_pi.dtype)
+        if self._all_experts_valid:
+            group_sums = fi_pi @ membership
+        else:
+            fi_pi_valid = fi_pi.index_select(0, self.valid_expert_indices)
+            membership_valid = membership.index_select(0, self.valid_expert_indices)
+            group_sums = fi_pi_valid @ membership_valid
+
+        group_losses = self.group_sizes.to(fi_pi.dtype) * group_sums
+        return group_losses.mean()
 
     def forward_with_intermediates(self, x: torch.Tensor) -> dict[str, Any]:
         """Forward pass that returns all intermediate tensors for testing.
@@ -302,7 +401,7 @@ class TritonMoEMLP(nn.Module):
 
     def forward_profiled(
         self, x: torch.Tensor, profiler
-    ) -> tuple[torch.Tensor, None, None]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None, torch.Tensor | None]:
         """Forward pass with per-step profiling.
 
         Args:
@@ -311,8 +410,8 @@ class TritonMoEMLP(nn.Module):
 
         Returns:
             output: Output tensor of shape [batch_size, seq_len, n_embd]
-            aux_loss: None (not implemented)
-            router_probs: None (not implemented)
+            aux_loss: Dictionary containing router_z_loss, load_balance_loss, compute_loss
+            f_i: Expert usage fractions tensor
         """
         batch_size, seq_len, n_embd = x.shape
         device = x.device
@@ -393,4 +492,18 @@ class TritonMoEMLP(nn.Module):
         with profiler.step("reshape"):
             output = rearrange(output_flat, "(b s) d -> b s d", b=batch_size)
 
-        return output, None, None
+        with profiler.step("aux_loss"):
+            router_z_loss = torch.logsumexp(router_logits, dim=-1).pow(2).mean()
+            f_i = (tokens_per_expert.float() / tokens_per_expert.sum()).to(x.dtype)
+            load_balance_loss = self._compute_load_balance_loss(router_probs, f_i)
+            compute_loss = (
+                router_probs @ self.expert_widths_normalized.to(router_probs.dtype)
+            ).mean()
+
+            aux_loss = {
+                "router_z_loss": router_z_loss,
+                "load_balance_loss": load_balance_loss,
+                "compute_loss": compute_loss,
+            }
+
+        return output, aux_loss, f_i

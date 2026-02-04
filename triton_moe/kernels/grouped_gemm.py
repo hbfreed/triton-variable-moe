@@ -1319,6 +1319,9 @@ class GroupedGemmUp(torch.autograd.Function):
         activation: str = "relu_squared",
     ) -> torch.Tensor:
         """Forward pass - calls the Triton kernel and saves tensors for backward."""
+        # Ensure x and w1 have same dtype for Triton kernel
+        x = x.to(w1.dtype)
+
         # We need to save pre-activation values for backward
         # First compute x @ W1 without activation
         pre_act = grouped_gemm_up(
@@ -1407,6 +1410,9 @@ class GroupedGemmDown(torch.autograd.Function):
         max_expert_width: int,
     ) -> torch.Tensor:
         """Forward pass - calls the Triton kernel and saves tensors for backward."""
+        # Ensure intermediate and w2 have same dtype for Triton kernel
+        intermediate = intermediate.to(w2.dtype)
+
         output = grouped_gemm_down(
             intermediate,
             w2,

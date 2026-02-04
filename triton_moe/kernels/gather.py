@@ -6,6 +6,7 @@ Reference: megablocks.ops.padded_gather
 import torch
 import triton
 import triton.language as tl
+from torch.amp import custom_bwd, custom_fwd
 from torch.autograd.function import once_differentiable
 
 
@@ -224,6 +225,7 @@ class PaddedGatherOp(torch.autograd.Function):
     """Autograd function for padded_gather."""
 
     @staticmethod
+    @custom_fwd(device_type="cuda")
     def forward(
         ctx,
         x: torch.Tensor,
@@ -239,6 +241,7 @@ class PaddedGatherOp(torch.autograd.Function):
         return padded_gather(x, indices, bin_ids, bins, padded_bins, top_k)
 
     @staticmethod
+    @custom_bwd(device_type="cuda")
     @once_differentiable
     def backward(ctx, grad_output: torch.Tensor):
         indices, bin_ids, bins, padded_bins = ctx.saved_tensors

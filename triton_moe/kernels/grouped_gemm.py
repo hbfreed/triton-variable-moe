@@ -29,6 +29,7 @@ Backward pass math:
 import torch
 import triton
 import triton.language as tl
+from torch.amp import custom_bwd, custom_fwd
 from torch.autograd.function import once_differentiable
 
 
@@ -1304,6 +1305,7 @@ class GroupedGemmUp(torch.autograd.Function):
     """Autograd function for grouped GEMM up-projection with fused activation."""
 
     @staticmethod
+    @custom_fwd(device_type="cuda")
     def forward(
         ctx,
         x: torch.Tensor,
@@ -1355,6 +1357,7 @@ class GroupedGemmUp(torch.autograd.Function):
         return output
 
     @staticmethod
+    @custom_bwd(device_type="cuda")
     @once_differentiable
     def backward(ctx, grad_output: torch.Tensor) -> tuple:
         """Backward pass - computes gradients w.r.t. x and w1."""
@@ -1391,6 +1394,7 @@ class GroupedGemmDown(torch.autograd.Function):
     """Autograd function for grouped GEMM down-projection."""
 
     @staticmethod
+    @custom_fwd(device_type="cuda")
     def forward(
         ctx,
         intermediate: torch.Tensor,
@@ -1428,6 +1432,7 @@ class GroupedGemmDown(torch.autograd.Function):
         return output
 
     @staticmethod
+    @custom_bwd(device_type="cuda")
     @once_differentiable
     def backward(ctx, grad_output: torch.Tensor) -> tuple:
         """Backward pass - computes gradients w.r.t. intermediate and w2."""

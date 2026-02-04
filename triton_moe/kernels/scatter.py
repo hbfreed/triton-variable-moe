@@ -6,6 +6,7 @@ Reference: megablocks.ops.padded_scatter
 import torch
 import triton
 import triton.language as tl
+from torch.amp import custom_bwd, custom_fwd
 from torch.autograd.function import once_differentiable
 
 
@@ -140,6 +141,7 @@ class PaddedScatterOp(torch.autograd.Function):
     """Autograd function for padded_scatter."""
 
     @staticmethod
+    @custom_fwd(device_type="cuda")
     def forward(
         ctx,
         x: torch.Tensor,
@@ -155,6 +157,7 @@ class PaddedScatterOp(torch.autograd.Function):
         return padded_scatter(x, indices, bin_ids, weights, bins, padded_bins, top_k)
 
     @staticmethod
+    @custom_bwd(device_type="cuda")
     @once_differentiable
     def backward(ctx, grad_output: torch.Tensor):
         indices, bin_ids, weights, bins, padded_bins = ctx.saved_tensors

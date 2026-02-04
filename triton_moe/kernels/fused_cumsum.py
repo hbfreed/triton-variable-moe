@@ -81,6 +81,7 @@ def _cumsum_kernel(
     tl.store(padded_bins_ptr + expert_offs, padded_bins, mask=mask)
 
 
+@torch.compiler.disable
 def fused_route(
     selected_experts: torch.Tensor,  # [num_assignments] int32/int64
     num_experts: int,

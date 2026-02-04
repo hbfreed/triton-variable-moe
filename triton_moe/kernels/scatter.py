@@ -69,6 +69,7 @@ def _padded_scatter_kernel(
         )
 
 
+@torch.compiler.disable
 def padded_scatter(
     x: torch.Tensor,
     indices: torch.Tensor,

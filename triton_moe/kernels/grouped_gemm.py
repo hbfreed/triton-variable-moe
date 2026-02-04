@@ -230,14 +230,12 @@ def _grouped_gemm_up_kernel(
 
 def _compute_total_tiles(tokens_per_expert, expert_widths, block_m, block_n):
     """Compute total number of tiles for grid launch."""
-    total = 0
-    for num_tokens, width in zip(tokens_per_expert.tolist(), expert_widths.tolist()):
-        m_tiles = (num_tokens + block_m - 1) // block_m
-        n_tiles = (width + block_n - 1) // block_n
-        total += m_tiles * n_tiles
-    return total
+    m_tiles = (tokens_per_expert + block_m - 1) // block_m
+    n_tiles = (expert_widths + block_n - 1) // block_n
+    return int((m_tiles * n_tiles).sum())
 
 
+@torch.compiler.disable
 def grouped_gemm_up(
     x: torch.Tensor,
     w1: torch.Tensor,
@@ -431,6 +429,7 @@ def _grouped_gemm_down_kernel(
     tl.store(out_ptrs, acc, mask=out_mask)
 
 
+@torch.compiler.disable
 def grouped_gemm_down(
     intermediate: torch.Tensor,
     w2: torch.Tensor,
@@ -1084,6 +1083,7 @@ def _grouped_gemm_down_backward_dw_kernel(
     tl.store(grad_w2_ptrs, acc, mask=out_mask)
 
 
+@torch.compiler.disable
 def grouped_gemm_up_backward(
     grad_output: torch.Tensor,
     x: torch.Tensor,
@@ -1164,15 +1164,11 @@ def grouped_gemm_up_backward(
     )
 
     # For grad_w1 kernel, we tile over (hidden_size, expert_width) per expert
-    # TODO: Implement proper grid for dW kernel
     def grid_dw(meta):
-        # Simple grid: compute tiles needed for all experts
-        total = 0
-        for width in expert_widths.tolist():
-            m_tiles = (hidden_size + meta["BLOCK_M"] - 1) // meta["BLOCK_M"]
-            n_tiles = (width + meta["BLOCK_N"] - 1) // meta["BLOCK_N"]
-            total += m_tiles * n_tiles
-        return (total,)
+        # Compute tiles needed for all experts using tensor ops
+        m_tiles = (hidden_size + meta["BLOCK_M"] - 1) // meta["BLOCK_M"]
+        n_tiles = (expert_widths + meta["BLOCK_N"] - 1) // meta["BLOCK_N"]
+        return (int(m_tiles * n_tiles.sum()),)
 
     _grouped_gemm_up_backward_dw_kernel[grid_dw](
         x,
@@ -1200,6 +1196,7 @@ def grouped_gemm_up_backward(
     return grad_x, grad_w1
 
 
+@torch.compiler.disable
 def grouped_gemm_down_backward(
     grad_output: torch.Tensor,
     intermediate: torch.Tensor,
@@ -1272,12 +1269,10 @@ def grouped_gemm_down_backward(
     hidden_size_per_expert = torch.full_like(expert_widths, hidden_size)
 
     def grid_dw(meta):
-        total = 0
-        for width in expert_widths.tolist():
-            m_tiles = (width + meta["BLOCK_M"] - 1) // meta["BLOCK_M"]
-            n_tiles = (hidden_size + meta["BLOCK_N"] - 1) // meta["BLOCK_N"]
-            total += m_tiles * n_tiles
-        return (total,)
+        # Compute tiles needed for all experts using tensor ops
+        m_tiles = (expert_widths + meta["BLOCK_M"] - 1) // meta["BLOCK_M"]
+        n_tiles = (hidden_size + meta["BLOCK_N"] - 1) // meta["BLOCK_N"]
+        return (int((m_tiles * n_tiles).sum()),)
 
     _grouped_gemm_down_backward_dw_kernel[grid_dw](
         intermediate,

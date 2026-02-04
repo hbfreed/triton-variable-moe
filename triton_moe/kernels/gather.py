@@ -60,6 +60,7 @@ def _padded_gather_kernel(
         tl.store(output_ptr + out_row * out_stride_row + cols * out_stride_col, vals, mask=mask)
 
 
+@torch.compiler.disable
 def padded_gather(
     x: torch.Tensor,
     indices: torch.Tensor,
@@ -173,6 +174,7 @@ def _weighted_padded_gather_kernel(
         tl.store(output_ptr + out_row * out_stride_row + cols * out_stride_col, vals * weight, mask=mask)
 
 
+@torch.compiler.disable
 def _weighted_padded_gather(
     x: torch.Tensor,
     indices: torch.Tensor,

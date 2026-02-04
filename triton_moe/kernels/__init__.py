@@ -1,7 +1,7 @@
 """Triton kernel implementations for MoE operations."""
 
-from .gather import gather
-from .scatter import scatter
+from .gather import padded_gather, padded_gather_autograd
+from .scatter import padded_scatter, padded_scatter_autograd
 from .grouped_gemm import (
     grouped_gemm_up,
     grouped_gemm_down,
@@ -12,11 +12,14 @@ from .grouped_gemm import (
     GroupedGemmUp,
     GroupedGemmDown,
 )
-from .activation import relu_squared, silu, swiglu
+from .fused_cumsum import fused_route
 
 __all__ = [
-    "gather",
-    "scatter",
+    # Gather/Scatter
+    "padded_gather",
+    "padded_gather_autograd",
+    "padded_scatter",
+    "padded_scatter_autograd",
     # Forward kernels
     "grouped_gemm_up",
     "grouped_gemm_down",
@@ -29,8 +32,6 @@ __all__ = [
     # Autograd Function classes
     "GroupedGemmUp",
     "GroupedGemmDown",
-    # Activations
-    "relu_squared",
-    "silu",
-    "swiglu",
+    # Routing
+    "fused_route",
 ]

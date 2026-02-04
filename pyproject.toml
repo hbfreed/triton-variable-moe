@@ -8,8 +8,6 @@ dependencies = [
     "torch>=2.0.0,<2.10",
     "triton",
     "einops",
-    "megablocks[all] @ git+https://github.com/hbfreed/megablocks-variable",
-    "stanford-stk",
 ]
 
 [build-system]
@@ -20,12 +18,14 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["reference", "triton_moe"]
+packages = ["triton_moe"]
 
 [dependency-groups]
 dev = [
     "pytest",
     "pytest-benchmark",
+    "megablocks[all] @ git+https://github.com/hbfreed/megablocks-variable",
+    "stanford-stk",
 ]
 
 [tool.pytest.ini_options]

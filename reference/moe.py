@@ -296,12 +296,8 @@ class MoEMLP(nn.Module):
         top_k_weights_flat = rearrange(top_k_weights, "... -> (...)")
         selected_experts_flat = rearrange(selected_experts, "... -> (...)")
 
-        print(f"Selected Experts Flat: \n{selected_experts_flat}\n\n")
         bin_ids, indices, tokens_per_expert = self._sort_tokens_by_expert(
             selected_experts_flat
-        )
-        print(
-            f"Bin Ids: \n{bin_ids}\n\n\n, Indices: \n{indices} \n\n\n, Tokens Per Expert: \n{tokens_per_expert}"
         )
 
         bins = ops.inclusive_cumsum(tokens_per_expert, 0).contiguous()

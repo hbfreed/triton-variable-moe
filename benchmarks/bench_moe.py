@@ -369,11 +369,155 @@ def run_benchmark(config: BenchmarkConfig) -> dict:
     return results
 
 
-def run_profiled_benchmark(config: BenchmarkConfig) -> tuple[AggregateProfiler, dict]:
+def benchmark_triton_forward_profiled(
+    model,
+    x: torch.Tensor,
+    num_warmup: int,
+    num_runs: int,
+) -> AggregateProfiler:
+    """Benchmark Triton forward pass with per-step profiling."""
+    # Warmup (without profiling)
+    for _ in range(num_warmup):
+        with torch.no_grad():
+            profiler = CUDAStepProfiler()
+            _ = model.forward_profiled(x, profiler)
+
+    torch.cuda.synchronize()
+
+    # Benchmark with profiling
+    agg = AggregateProfiler()
+    for _ in range(num_runs):
+        profiler = CUDAStepProfiler()
+        with torch.no_grad():
+            _ = model.forward_profiled(x, profiler)
+        agg.add_result(profiler.get_result())
+
+    return agg
+
+
+def _categorize_triton_backward_op(op_name: str) -> str | None:
+    """Categorize a Triton backward operation into a meaningful group."""
+    name_lower = op_name.lower()
+
+    # Triton kernels
+    if "grouped_gemm_up_bwd" in name_lower or "_grouped_gemm_up_bwd" in name_lower:
+        return "gemm_up_bwd"
+    if "grouped_gemm_down_bwd" in name_lower or "_grouped_gemm_down_bwd" in name_lower:
+        return "gemm_down_bwd"
+    if "padded_gather_bwd" in name_lower or "_padded_gather_bwd" in name_lower:
+        return "gather_bwd"
+    if "padded_scatter_bwd" in name_lower or "_padded_scatter_bwd" in name_lower:
+        return "scatter_bwd"
+
+    # Generic triton kernels (forward kernels used in backward)
+    if "triton" in name_lower:
+        return "triton_kernel"
+
+    # GEMM kernels (cutlass/cublas for router backward)
+    if "cutlass" in name_lower or "cublas" in name_lower:
+        return "gemm_bwd"
+
+    # Routing backward
+    if "sigmoid_backward" in name_lower:
+        return "routing_bwd"
+
+    # Element-wise ops
+    if "mulfunctor" in name_lower or "addfunctor" in name_lower:
+        return "elementwise"
+    if "divfunctor" in name_lower or "neg_kernel" in name_lower:
+        return "elementwise"
+
+    # Reduce operations
+    if "reduce_kernel" in name_lower:
+        return "reduce"
+
+    # Memory operations
+    if "memcpy" in name_lower or "memset" in name_lower:
+        return "memory"
+
+    # Fill operations
+    if "fillfunctor" in name_lower:
+        return "zero_fill"
+
+    return None
+
+
+def benchmark_triton_backward_profiled(
+    model,
+    x: torch.Tensor,
+    num_warmup: int,
+    num_runs: int,
+) -> dict[str, dict[str, float]]:
+    """Benchmark Triton backward pass with profiling using torch.profiler."""
+    import time
+    from collections import defaultdict
+
+    # Warmup
+    for _ in range(num_warmup):
+        model.zero_grad()
+        x_clone = x.clone().requires_grad_(True)
+        out, _, _ = model(x_clone)
+        out.sum().backward()
+
+    torch.cuda.synchronize()
+
+    # Collect timing data
+    all_step_times: dict[str, list[float]] = defaultdict(list)
+    wall_clock_times: list[float] = []
+
+    for _ in range(num_runs):
+        model.zero_grad()
+        x_clone = x.clone().requires_grad_(True)
+
+        # Forward pass (not profiled here)
+        out, _, _ = model(x_clone)
+
+        torch.cuda.synchronize()
+
+        # Profile backward with wall-clock timing
+        start_time = time.perf_counter()
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA],
+        ) as prof:
+            out.sum().backward()
+        torch.cuda.synchronize()
+        wall_clock_times.append((time.perf_counter() - start_time) * 1000)
+
+        # Categorize and aggregate CUDA times
+        step_times: dict[str, float] = defaultdict(float)
+        for event in prof.key_averages():
+            category = _categorize_triton_backward_op(event.key)
+            if category and event.device_time_total > 0:
+                step_times[category] += event.device_time_total / 1000  # Convert to ms
+
+        for name, time_ms in step_times.items():
+            all_step_times[name].append(time_ms)
+
+    # Compute mean and std
+    means = {name: sum(times) / len(times) for name, times in all_step_times.items()}
+    stds = {}
+    for name, times in all_step_times.items():
+        mean = means[name]
+        variance = sum((t - mean) ** 2 for t in times) / len(times)
+        stds[name] = variance ** 0.5
+
+    wall_mean = sum(wall_clock_times) / len(wall_clock_times)
+    wall_std = (sum((t - wall_mean) ** 2 for t in wall_clock_times) / len(wall_clock_times)) ** 0.5
+
+    return {
+        "mean": means,
+        "std": stds,
+        "num_runs": num_runs,
+        "wall_clock_mean": wall_mean,
+        "wall_clock_std": wall_std,
+    }
+
+
+def run_profiled_benchmark(config: BenchmarkConfig) -> dict:
     """Run profiled benchmark for a given configuration.
 
     Returns:
-        Tuple of (forward_profiler, backward_profile_dict)
+        Dict with 'ref_fwd', 'ref_bwd', and optionally 'triton_fwd' profilers
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
@@ -398,15 +542,39 @@ def run_profiled_benchmark(config: BenchmarkConfig) -> tuple[AggregateProfiler, 
         dtype=torch.bfloat16,
     )
 
-    # Run profiled benchmarks
-    fwd_profiler = benchmark_forward_profiled(
+    results = {}
+
+    # Run reference profiled benchmarks
+    results["ref_fwd"] = benchmark_forward_profiled(
         ref_model, x, config.num_warmup, config.num_runs
     )
-    bwd_profile = benchmark_backward_profiled(
+    results["ref_bwd"] = benchmark_backward_profiled(
         ref_model, x, config.num_warmup, config.num_runs
     )
 
-    return fwd_profiler, bwd_profile
+    # Run Triton profiled benchmarks if available
+    if TRITON_AVAILABLE:
+        triton_config = TritonMoEConfig(
+            n_embd=config.n_embd,
+            expert_sizes=config.expert_sizes,
+            num_active_experts=config.num_active_experts,
+            block_size=128,
+        )
+        triton_model = TritonMoEMLP(triton_config).to(device).to(torch.bfloat16)
+
+        # Copy weights for fair comparison
+        triton_model.router.weight.data.copy_(ref_model.router.weight.data)
+        triton_model.w1.data.copy_(ref_model.w1.data)
+        triton_model.w2.data.copy_(ref_model.w2.data)
+
+        results["triton_fwd"] = benchmark_triton_forward_profiled(
+            triton_model, x, config.num_warmup, config.num_runs
+        )
+        results["triton_bwd"] = benchmark_triton_backward_profiled(
+            triton_model, x, config.num_warmup, config.num_runs
+        )
+
+    return results
 
 
 def print_backward_profile(bwd_profile: dict, indent: str = "  "):
@@ -641,15 +809,37 @@ def main():
     if args.profile:
         # Run profiled benchmarks showing per-step timing
         print("\n" + "=" * 60)
-        print("Per-Step Profiling Results (Reference Implementation)")
+        print("Per-Step Profiling Results")
         print("=" * 60)
 
         for config in configs:
             print(f"\n{config.name} (batch={config.batch_size}, seq={config.seq_len}, embd={config.n_embd}):")
-            fwd_agg, bwd_profile = run_profiled_benchmark(config)
-            fwd_agg.print_summary()
-            print()
-            print_backward_profile(bwd_profile)
+            results = run_profiled_benchmark(config)
+
+            print("\n  --- Reference Forward ---")
+            results["ref_fwd"].print_summary()
+
+            if "triton_fwd" in results:
+                print("\n  --- Triton Forward ---")
+                results["triton_fwd"].print_summary()
+
+                # Print speedup comparison
+                ref_total = sum(results["ref_fwd"].get_mean_times().values())
+                tri_total = sum(results["triton_fwd"].get_mean_times().values())
+                print(f"\n  Forward Speedup: {ref_total / tri_total:.2f}x")
+
+            print("\n  --- Reference Backward ---")
+            print_backward_profile(results["ref_bwd"])
+
+            if "triton_bwd" in results:
+                print("\n  --- Triton Backward ---")
+                print_backward_profile(results["triton_bwd"])
+
+                # Print backward speedup
+                ref_bwd_wall = results["ref_bwd"].get("wall_clock_mean", 0)
+                tri_bwd_wall = results["triton_bwd"].get("wall_clock_mean", 0)
+                if tri_bwd_wall > 0:
+                    print(f"\n  Backward Speedup (wall clock): {ref_bwd_wall / tri_bwd_wall:.2f}x")
     else:
         # Run standard benchmarks
         results = []

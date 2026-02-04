@@ -1317,9 +1317,9 @@ class GroupedGemmUp(torch.autograd.Function):
         # Ensure x and w1 have same dtype for Triton kernel
         x = x.to(w1.dtype)
 
-        # We need to save pre-activation values for backward
-        # First compute x @ W1 without activation
-        pre_act = grouped_gemm_up(
+        # Use fused kernel for forward (faster than separate matmul + activation)
+        # We'll recompute pre_act in backward to save memory
+        output = grouped_gemm_up(
             x,
             w1,
             expert_token_offsets,
@@ -1327,22 +1327,13 @@ class GroupedGemmUp(torch.autograd.Function):
             expert_widths,
             tokens_per_expert,
             max_expert_width,
-            activation="none",
+            activation=activation,
         )
 
-        # Apply activation
-        if activation == "relu_squared":
-            output = torch.where(
-                pre_act > 0, pre_act * pre_act, torch.zeros_like(pre_act)
-            )
-        else:
-            output = pre_act
-
-        # Save for backward
+        # Save for backward - don't save pre_act, we'll recompute it
         ctx.save_for_backward(
             x,
             w1,
-            pre_act,
             expert_token_offsets,
             expert_weight_offsets,
             expert_widths,
@@ -1362,12 +1353,23 @@ class GroupedGemmUp(torch.autograd.Function):
         (
             x,
             w1,
-            pre_act,
             expert_token_offsets,
             expert_weight_offsets,
             expert_widths,
             tokens_per_expert,
         ) = ctx.saved_tensors
+
+        # Recompute pre_act (trades compute for memory)
+        pre_act = grouped_gemm_up(
+            x,
+            w1,
+            expert_token_offsets,
+            expert_weight_offsets,
+            expert_widths,
+            tokens_per_expert,
+            ctx.max_expert_width,
+            activation="none",
+        )
 
         grad_x, grad_w1 = grouped_gemm_up_backward(
             grad_output,

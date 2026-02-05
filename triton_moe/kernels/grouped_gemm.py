@@ -694,7 +694,15 @@ def _grouped_gemm_up_backward_dx_kernel(
         grad_out_tile = tl.load(grad_out_ptrs, mask=grad_out_mask, other=0.0)
 
         # Apply activation derivative and accumulate grad_x
-        grad_out_f32 = grad_out_tile.to(tl.float32)
+        # Load W1.T tile (shared across all activation paths)
+        w1_col_indices = weight_col_start + k_indices
+        w1_ptrs = (
+            w1_ptr
+            + (n_start + offs_n)[:, None] * stride_w1_row
+            + w1_col_indices[None, :] * stride_w1_col
+        )
+        w_mask = n_mask[:, None] & k_mask[None, :]
+        w1_tile_t = tl.load(w1_ptrs, mask=w_mask, other=0.0)  # native dtype for tensor cores
 
         if ACTIVATION == 1:  # relu_squared
             # pre_act = z = x @ W1, d/dz[relu(z)^2] = 2*z when z > 0
@@ -705,47 +713,26 @@ def _grouped_gemm_up_backward_dx_kernel(
             )
             pre_act_tile = tl.load(pre_act_ptrs, mask=grad_out_mask, other=0.0)
             pre_act_f32 = pre_act_tile.to(tl.float32)
+            grad_out_f32 = grad_out_tile.to(tl.float32)
+            # Compute derivative in f32, cast back for tensor core dot
             grad_act_tile = tl.where(
                 pre_act_f32 > 0, grad_out_f32 * 2.0 * pre_act_f32, 0.0
-            )
+            ).to(grad_out_tile.dtype)
 
-            # Load W1.T tile and accumulate
-            w1_col_indices = weight_col_start + k_indices
-            w1_ptrs = (
-                w1_ptr
-                + (n_start + offs_n)[:, None] * stride_w1_row
-                + w1_col_indices[None, :] * stride_w1_col
-            )
-            w_mask = n_mask[:, None] & k_mask[None, :]
-            w1_tile_t = tl.load(w1_ptrs, mask=w_mask, other=0.0).to(tl.float32)
             acc += tl.dot(grad_act_tile, tl.trans(w1_tile_t))
 
         elif ACTIVATION == 2:  # swiglu
             # For swiglu, pre_act_ptr contains output
-            # output = silu(gate) * up, where silu(x) = x * sigmoid(x)
-            # This needs gate saved separately - not fully optimized yet
             # Placeholder implementation
             output_ptrs = (
                 pre_act_ptr
                 + m_indices[:, None] * stride_pre_act_row
                 + k_indices[None, :] * stride_pre_act_col
             )
-            output_tile = tl.load(output_ptrs, mask=grad_out_mask, other=0.0).to(tl.float32)
+            output_tile = tl.load(output_ptrs, mask=grad_out_mask, other=0.0)
 
             # Simplified swiglu backward (incomplete - needs gate)
-            grad_gate_tile = grad_out_f32
-            grad_up_tile = grad_out_f32
-
-            # Load W1_gate.T and accumulate
-            w1_gate_col_indices = weight_col_start + k_indices
-            w1_gate_ptrs = (
-                w1_ptr
-                + (n_start + offs_n)[:, None] * stride_w1_row
-                + w1_gate_col_indices[None, :] * stride_w1_col
-            )
-            w_mask = n_mask[:, None] & k_mask[None, :]
-            w1_gate_tile_t = tl.load(w1_gate_ptrs, mask=w_mask, other=0.0).to(tl.float32)
-            acc += tl.dot(grad_gate_tile, tl.trans(w1_gate_tile_t))
+            acc += tl.dot(grad_out_tile, tl.trans(w1_tile_t))
 
             # Load W1_up.T and accumulate
             w1_up_col_indices = weight_col_start + expert_width + k_indices
@@ -754,22 +741,11 @@ def _grouped_gemm_up_backward_dx_kernel(
                 + (n_start + offs_n)[:, None] * stride_w1_row
                 + w1_up_col_indices[None, :] * stride_w1_col
             )
-            w1_up_tile_t = tl.load(w1_up_ptrs, mask=w_mask, other=0.0).to(tl.float32)
-            acc += tl.dot(grad_up_tile, tl.trans(w1_up_tile_t))
+            w1_up_tile_t = tl.load(w1_up_ptrs, mask=w_mask, other=0.0)
+            acc += tl.dot(grad_out_tile, tl.trans(w1_up_tile_t))
 
         else:  # no activation
-            grad_act_tile = grad_out_f32
-
-            # Load W1.T tile and accumulate
-            w1_col_indices = weight_col_start + k_indices
-            w1_ptrs = (
-                w1_ptr
-                + (n_start + offs_n)[:, None] * stride_w1_row
-                + w1_col_indices[None, :] * stride_w1_col
-            )
-            w_mask = n_mask[:, None] & k_mask[None, :]
-            w1_tile_t = tl.load(w1_ptrs, mask=w_mask, other=0.0).to(tl.float32)
-            acc += tl.dot(grad_act_tile, tl.trans(w1_tile_t))
+            acc += tl.dot(grad_out_tile, tl.trans(w1_tile_t))
 
     # Store grad_x
     grad_x_col_indices = n_start + offs_n
@@ -905,7 +881,7 @@ def _grouped_gemm_up_backward_dw_kernel(
             + (m_start + offs_m)[None, :] * stride_x_col
         )
         x_mask = k_mask[:, None] & m_mask[None, :]
-        x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0).to(tl.float32)  # [BLOCK_K, BLOCK_M]
+        x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0)  # [BLOCK_K, BLOCK_M] native dtype for tensor cores
 
         # Load grad_output tile [BLOCK_K, BLOCK_N]
         grad_col_indices = n_start + offs_n
@@ -916,7 +892,6 @@ def _grouped_gemm_up_backward_dw_kernel(
         )
         grad_out_mask = k_mask[:, None] & n_mask[None, :]
         grad_out_tile = tl.load(grad_out_ptrs, mask=grad_out_mask, other=0.0)
-        grad_out_f32 = grad_out_tile.to(tl.float32)
 
         # Apply activation derivative
         if ACTIVATION == 1:  # relu_squared
@@ -928,9 +903,11 @@ def _grouped_gemm_up_backward_dw_kernel(
             )
             pre_act_tile = tl.load(pre_act_ptrs, mask=grad_out_mask, other=0.0)
             pre_act_f32 = pre_act_tile.to(tl.float32)
+            grad_out_f32 = grad_out_tile.to(tl.float32)
+            # Compute derivative in f32, cast back for tensor core dot
             grad_act_tile = tl.where(
                 pre_act_f32 > 0, grad_out_f32 * 2.0 * pre_act_f32, 0.0
-            )
+            ).to(grad_out_tile.dtype)
             acc += tl.dot(tl.trans(x_tile), grad_act_tile)
 
         elif ACTIVATION == 2:  # swiglu
@@ -940,19 +917,15 @@ def _grouped_gemm_up_backward_dw_kernel(
                 + k_indices[:, None] * stride_pre_act_row
                 + grad_col_indices[None, :] * stride_pre_act_col
             )
-            output_tile = tl.load(output_ptrs, mask=grad_out_mask, other=0.0).to(tl.float32)
-
-            grad_gate_tile = grad_out_f32
-            grad_up_tile = grad_out_f32
+            output_tile = tl.load(output_ptrs, mask=grad_out_mask, other=0.0)
 
             # grad_W1_gate += x.T @ grad_gate
-            acc += tl.dot(tl.trans(x_tile), grad_gate_tile)
+            acc += tl.dot(tl.trans(x_tile), grad_out_tile)
             # grad_W1_up += x.T @ grad_up
-            acc_up += tl.dot(tl.trans(x_tile), grad_up_tile)
+            acc_up += tl.dot(tl.trans(x_tile), grad_out_tile)
 
         else:  # no activation
-            grad_act_tile = grad_out_f32
-            acc += tl.dot(tl.trans(x_tile), grad_act_tile)
+            acc += tl.dot(tl.trans(x_tile), grad_out_tile)
 
     # Store grad_W1 (and grad_W1_up for swiglu)
     out_mask = m_mask[:, None] & n_mask[None, :]
@@ -1249,7 +1222,7 @@ def grouped_gemm_up_backward(
     grad_output: torch.Tensor,
     x: torch.Tensor,
     w1: torch.Tensor,
-    output: torch.Tensor,
+    pre_act: torch.Tensor,
     expert_token_offsets: torch.Tensor,
     expert_weight_offsets: torch.Tensor,
     expert_widths: torch.Tensor,
@@ -1263,8 +1236,8 @@ def grouped_gemm_up_backward(
         grad_output: Gradient w.r.t. activated output [total_tokens, max_expert_width]
         x: Original input [total_tokens, hidden_size]
         w1: Up-projection weights [hidden_size, total_expert_width]
-        output: Activated output from forward pass [total_tokens, max_expert_width]
-            Kernels compute sqrt(output) per tile for relu_squared activation.
+        pre_act: Pre-activation values from forward [total_tokens, max_expert_width]
+            For relu_squared: relu(z) where z = x @ W1
         expert_token_offsets: Cumulative token counts [num_experts + 1]
         expert_weight_offsets: Cumulative weight offsets [num_experts + 1]
         expert_widths: Per-expert intermediate sizes [num_experts]
@@ -1305,13 +1278,13 @@ def grouped_gemm_up_backward(
 
     _grouped_gemm_up_backward_dx_kernel[grid_dx](
         grad_output,
-        output,  # kernels compute sqrt(output) per tile
+        pre_act,
         w1,
         grad_x,
         grad_output.stride(0),
         grad_output.stride(1),
-        output.stride(0),
-        output.stride(1),
+        pre_act.stride(0),
+        pre_act.stride(1),
         w1.stride(0),
         w1.stride(1),
         grad_x.stride(0),
@@ -1335,14 +1308,14 @@ def grouped_gemm_up_backward(
     _grouped_gemm_up_backward_dw_kernel[grid_dw](
         x,
         grad_output,
-        output,  # kernels compute sqrt(output) per tile
+        pre_act,
         grad_w1,
         x.stride(0),
         x.stride(1),
         grad_output.stride(0),
         grad_output.stride(1),
-        output.stride(0),
-        output.stride(1),
+        pre_act.stride(0),
+        pre_act.stride(1),
         grad_w1.stride(0),
         grad_w1.stride(1),
         expert_token_offsets,
@@ -1479,8 +1452,8 @@ class GroupedGemmUp(torch.autograd.Function):
         # Ensure x and w1 have same dtype for Triton kernel
         x = x.to(w1.dtype)
 
-        # Use fused kernel for forward - don't save output to reduce memory
-        output = grouped_gemm_up(
+        # Save pre_act from forward to avoid recomputation in backward
+        output, pre_act = grouped_gemm_up(
             x,
             w1,
             expert_token_offsets,
@@ -1489,14 +1462,13 @@ class GroupedGemmUp(torch.autograd.Function):
             tokens_per_expert,
             max_expert_width,
             activation=activation,
-            save_pre_act=False,
+            save_pre_act=True,
         )
 
-        # Save for backward - DON'T save output to reduce peak memory
-        # This allows larger batch sizes at cost of recomputing pre_act
         ctx.save_for_backward(
             x,
             w1,
+            pre_act,
             expert_token_offsets,
             expert_weight_offsets,
             expert_widths,
@@ -1516,24 +1488,12 @@ class GroupedGemmUp(torch.autograd.Function):
         (
             x,
             w1,
+            pre_act,
             expert_token_offsets,
             expert_weight_offsets,
             expert_widths,
             tokens_per_expert,
         ) = ctx.saved_tensors
-
-        # Recompute pre_act = x @ W1 (no activation)
-        # Trades compute for memory - allows larger batch sizes
-        pre_act = grouped_gemm_up(
-            x,
-            w1,
-            expert_token_offsets,
-            expert_weight_offsets,
-            expert_widths,
-            tokens_per_expert,
-            ctx.max_expert_width,
-            activation="none",
-        )
 
         grad_x, grad_w1 = grouped_gemm_up_backward(
             grad_output,

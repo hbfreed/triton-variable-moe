@@ -665,7 +665,7 @@ def main():
         help="Batch sizes to benchmark",
     )
     parser.add_argument("--seq-len", type=int, default=512, help="Sequence length")
-    parser.add_argument("--n-embd", type=int, default=256, help="Embedding dimension")
+    parser.add_argument("--n-embd", type=int, default=768, help="Embedding dimension")
     parser.add_argument(
         "--num-warmup", type=int, default=10, help="Number of warmup runs"
     )

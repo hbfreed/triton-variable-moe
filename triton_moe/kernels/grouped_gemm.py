@@ -1452,8 +1452,8 @@ class GroupedGemmUp(torch.autograd.Function):
         # Ensure x and w1 have same dtype for Triton kernel
         x = x.to(w1.dtype)
 
-        # Save pre_act from forward to avoid recomputation in backward
-        output, pre_act = grouped_gemm_up(
+        # Don't save pre_act to keep peak memory low (allows larger batch sizes)
+        output = grouped_gemm_up(
             x,
             w1,
             expert_token_offsets,
@@ -1462,13 +1462,12 @@ class GroupedGemmUp(torch.autograd.Function):
             tokens_per_expert,
             max_expert_width,
             activation=activation,
-            save_pre_act=True,
+            save_pre_act=False,
         )
 
         ctx.save_for_backward(
             x,
             w1,
-            pre_act,
             expert_token_offsets,
             expert_weight_offsets,
             expert_widths,
@@ -1488,12 +1487,23 @@ class GroupedGemmUp(torch.autograd.Function):
         (
             x,
             w1,
-            pre_act,
             expert_token_offsets,
             expert_weight_offsets,
             expert_widths,
             tokens_per_expert,
         ) = ctx.saved_tensors
+
+        # Recompute pre_act to save memory (allows larger batch sizes)
+        pre_act = grouped_gemm_up(
+            x,
+            w1,
+            expert_token_offsets,
+            expert_weight_offsets,
+            expert_widths,
+            tokens_per_expert,
+            ctx.max_expert_width,
+            activation="none",
+        )
 
         grad_x, grad_w1 = grouped_gemm_up_backward(
             grad_output,

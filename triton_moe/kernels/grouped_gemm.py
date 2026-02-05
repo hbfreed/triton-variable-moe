@@ -1446,8 +1446,10 @@ class GroupedGemmUp(torch.autograd.Function):
             # Save x_flat + gather_map instead of x_gathered for memory efficiency.
             # x_flat is already alive (shared with rest of model), so saving it is ~free.
             # gather_map is tiny (~80KB). This lets x_gathered be freed after forward.
+            # Ensure x_flat has same dtype as w1 (bf16) for backward kernel compatibility
+            x_flat_saved = x_flat.to(w1.dtype)
             ctx.save_for_backward(
-                x_flat,
+                x_flat_saved,
                 w1,
                 pre_act,
                 expert_token_offsets,

@@ -34,25 +34,42 @@ from torch.autograd.function import once_differentiable
 
 
 def _autotune_configs():
-    """Generate expanded autotune configs for grouped GEMM kernels."""
-    configs = []
-    for BLOCK_M in [64, 128]:
-        for BLOCK_N in [64, 128]:
-            for BLOCK_K in [32, 64]:
-                for GROUP_M in [1, 4, 8, 16]:
-                    for num_warps in [4, 8]:
-                        for num_stages in [2, 3]:
-                            # Skip configs likely to exceed shared memory
-                            # ~2 * num_stages * (BLOCK_M*BLOCK_K + BLOCK_K*BLOCK_N) bytes
-                            smem = 2 * num_stages * (BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N)
-                            if smem > 96_000:
-                                continue
-                            configs.append(triton.Config(
-                                {"BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N,
-                                 "BLOCK_K": BLOCK_K, "GROUP_M": GROUP_M},
-                                num_stages=num_stages, num_warps=num_warps,
-                            ))
-    return configs
+    """Autotune configs for grouped GEMM kernels.
+
+    Trimmed to ~12 configs covering the important space:
+    - BLOCK_M/N: 64 and 128 (the two practical sizes for 3090)
+    - BLOCK_K: 64 (best for bf16 tensor cores)
+    - GROUP_M: 8 (best L2 swizzle for our workload)
+    - num_warps: 4 for small tiles, 8 for large
+    - num_stages: 3 (pipeline depth, good for 3090)
+    """
+    return [
+        # Small tiles (good for small expert counts / low token counts)
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_M": 8},
+                      num_stages=3, num_warps=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8},
+                      num_stages=3, num_warps=4),
+        # Mixed tiles
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_M": 8},
+                      num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8},
+                      num_stages=3, num_warps=8),
+        # Large tiles (good for high token counts)
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8},
+                      num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 8},
+                      num_stages=3, num_warps=8),
+        # GROUP_M variants for the most common tile sizes
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_M": 4},
+                      num_stages=3, num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_M": 4},
+                      num_stages=3, num_warps=8),
+        # 2-stage pipeline variants
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_M": 8},
+                      num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8},
+                      num_stages=2, num_warps=8),
+    ]
 
 
 @triton.jit
@@ -82,6 +99,54 @@ def fast_sqrt(x: torch.Tensor) -> torch.Tensor:
     grid = ((n_elements + BLOCK_SIZE - 1) // BLOCK_SIZE,)
     _sqrt_kernel[grid](x, out, n_elements, BLOCK_SIZE=BLOCK_SIZE)
     return out
+
+
+@torch.compiler.disable
+def precompute_gather_map(
+    indices: torch.Tensor,
+    bin_ids: torch.Tensor,
+    bins: torch.Tensor,
+    padded_bins: torch.Tensor,
+    top_k: int,
+) -> torch.Tensor:
+    """Precompute mapping from gathered-space rows to original x_flat rows.
+
+    This enables fusing gather into GEMM kernels: instead of materializing
+    x_gathered, the kernel loads x_flat[gather_map[gathered_row]] on the fly.
+
+    Args:
+        indices: Sorted indices [num_expanded] into expanded (num_tokens * top_k) array
+        bin_ids: Expert ID for each sorted position [num_expanded]
+        bins: Cumsum of tokens per expert, unpadded [num_experts]
+        padded_bins: Cumsum of tokens per expert, padded [num_experts]
+        top_k: Number of experts per token
+
+    Returns:
+        gather_map: [total_padded] int32 tensor mapping gathered row -> original token row
+    """
+    total_padded = padded_bins[-1].item()
+    gather_map = torch.zeros(total_padded, dtype=torch.int32, device=indices.device)
+
+    num_expanded = len(indices)
+    if num_expanded == 0:
+        return gather_map
+
+    # Vectorized: compute output position and source token for each sorted index
+    bin_starts = torch.cat([torch.zeros(1, device=bins.device, dtype=bins.dtype), bins[:-1]])
+    padded_starts = torch.cat([
+        torch.zeros(1, device=padded_bins.device, dtype=padded_bins.dtype),
+        padded_bins[:-1],
+    ])
+
+    expert_bin_starts = bin_starts[bin_ids]
+    expert_padded_starts = padded_starts[bin_ids]
+    pids = torch.arange(num_expanded, device=indices.device, dtype=bins.dtype)
+    offsets_in_bin = pids - expert_bin_starts
+    out_rows = (expert_padded_starts + offsets_in_bin).long()
+    src_tokens = (indices // top_k).int()
+
+    gather_map[out_rows] = src_tokens
+    return gather_map
 
 
 @triton.jit
@@ -151,10 +216,11 @@ def _compute_tile_info(
 @triton.jit
 def _grouped_gemm_up_kernel(
     # Pointers
-    x_ptr,  # [total_tokens, hidden_size]
+    x_ptr,  # [num_tokens, hidden_size] (original or gathered)
     w1_ptr,  # [hidden_size, total_expert_width]
     out_ptr,  # [total_tokens, max_expert_width] (padded)
     pre_act_ptr,  # [total_tokens, max_expert_width] (padded) - pre-activation for backward
+    gather_map_ptr,  # [total_padded] int32, maps gathered row -> original token row
     # Strides
     stride_x_row,
     stride_x_col,
@@ -181,6 +247,8 @@ def _grouped_gemm_up_kernel(
     ACTIVATION: tl.constexpr,
     # Whether to save pre-activation values for backward
     SAVE_PRE_ACT: tl.constexpr,
+    # Whether to use gather_map for indirect x loading (fused gather)
+    USE_GATHER_MAP: tl.constexpr,
 ):
     """Grouped GEMM for up-projection: intermediate = x @ W1
 
@@ -210,12 +278,18 @@ def _grouped_gemm_up_kernel(
     offs_k = tl.arange(0, BLOCK_K)
     offs_n = tl.arange(0, BLOCK_N)
 
-    # Global indices
+    # Global indices (in gathered space)
     m_indices = token_start + m_start + offs_m
 
     # Boundary masks
     m_mask = m_indices < token_end
     n_mask = (n_start + offs_n) < expert_width
+
+    # For fused gather: remap row indices to original x_flat rows
+    if USE_GATHER_MAP:
+        x_m_indices = tl.load(gather_map_ptr + m_indices, mask=m_mask, other=0)
+    else:
+        x_m_indices = m_indices
 
     # Weight column indices
     w1_col_indices = weight_col_start + n_start + offs_n
@@ -230,7 +304,7 @@ def _grouped_gemm_up_kernel(
         # Load x tile [BLOCK_M, BLOCK_K]
         x_ptrs = (
             x_ptr
-            + m_indices[:, None] * stride_x_row
+            + x_m_indices[:, None] * stride_x_row
             + k_indices[None, :] * stride_x_col
         )
         x_mask = m_mask[:, None] & k_mask[None, :]
@@ -312,11 +386,13 @@ def grouped_gemm_up(
     max_expert_width: int,
     activation: str = "relu_squared",
     save_pre_act: bool = False,
+    gather_map: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Grouped GEMM for up-projection with fused activation.
 
     Args:
-        x: Gathered input [total_tokens, hidden_size] - tokens sorted by expert
+        x: Input tensor. If gather_map is None: [total_tokens, hidden_size] (gathered).
+            If gather_map is provided: [num_tokens, hidden_size] (original order).
         w1: Up-projection weights [hidden_size, total_expert_width]
         expert_token_offsets: Cumulative token counts [num_experts + 1]
         expert_weight_offsets: Cumulative weight column offsets [num_experts + 1]
@@ -325,6 +401,8 @@ def grouped_gemm_up(
         max_expert_width: Max expert width (for output allocation)
         activation: Activation function ("none", "relu_squared", "swiglu")
         save_pre_act: If True, also return pre-activation values for backward
+        gather_map: Optional [total_padded] int32 tensor mapping gathered row -> original row.
+            When provided, fuses gather into the GEMM (avoids x_gathered allocation).
 
     Returns:
         If save_pre_act=False: Intermediate activations [total_tokens, max_expert_width]
@@ -332,10 +410,13 @@ def grouped_gemm_up(
             - For relu_squared: pre_act = relu(z), used for grad = 2 * pre_act
             - For swiglu: pre_act = gate (before silu), used for backward
     """
-    total_tokens, hidden_size = x.shape
+    total_tokens = expert_token_offsets[-1].item()
+    hidden_size = x.shape[1]
     num_experts = len(expert_widths)
     device = x.device
     dtype = x.dtype
+
+    use_gather_map = gather_map is not None
 
     # Allocate output
     output = torch.zeros(total_tokens, max_expert_width, device=device, dtype=dtype)
@@ -353,6 +434,10 @@ def grouped_gemm_up(
 
     activation_code = {"none": 0, "relu_squared": 1, "swiglu": 2}.get(activation, 0)
 
+    # Dummy gather_map pointer when not using fused gather
+    if not use_gather_map:
+        gather_map = expert_token_offsets  # Won't be read; just need a valid pointer
+
     # Grid function computes total tiles based on autotune-selected block sizes
     def grid(meta):
         return (
@@ -367,6 +452,7 @@ def grouped_gemm_up(
         w1,
         output,
         pre_act,
+        gather_map,
         x.stride(0),
         x.stride(1),
         w1.stride(0),
@@ -383,6 +469,7 @@ def grouped_gemm_up(
         num_experts,
         ACTIVATION=activation_code,
         SAVE_PRE_ACT=save_pre_act,
+        USE_GATHER_MAP=use_gather_map,
     )
 
     if save_pre_act:
@@ -722,10 +809,11 @@ def _grouped_gemm_up_backward_dx_kernel(
 @triton.jit
 def _grouped_gemm_up_backward_dw_kernel(
     # Pointers
-    x_ptr,  # [total_tokens, hidden_size]
+    x_ptr,  # [num_tokens, hidden_size] (original or gathered)
     grad_output_ptr,  # [total_tokens, max_expert_width]
     pre_act_ptr,  # [total_tokens, max_expert_width] - pre-activation values
     grad_w1_ptr,  # [hidden_size, total_expert_width] - output
+    gather_map_ptr,  # [total_padded] int32, maps gathered row -> original token row
     # Strides
     stride_x_row,
     stride_x_col,
@@ -751,6 +839,8 @@ def _grouped_gemm_up_backward_dw_kernel(
     GROUP_M: tl.constexpr,
     # Activation
     ACTIVATION: tl.constexpr,
+    # Whether to use gather_map for indirect x loading (fused gather)
+    USE_GATHER_MAP: tl.constexpr,
 ):
     """Backward kernel for grad_W1 = x.T @ grad_act
 
@@ -794,11 +884,17 @@ def _grouped_gemm_up_backward_dw_kernel(
         k_indices = token_start + k + offs_k
         k_mask = (k + offs_k) < num_tokens
 
+        # For fused gather: remap row indices to original x_flat rows
+        if USE_GATHER_MAP:
+            x_k_indices = tl.load(gather_map_ptr + k_indices, mask=k_mask, other=0)
+        else:
+            x_k_indices = k_indices
+
         # Load x.T tile: x is [total_tokens, hidden_size], x.T is [hidden_size, total_tokens]
         # x.T[m, k] = x[k, m]
         x_ptrs = (
             x_ptr
-            + k_indices[:, None] * stride_x_row
+            + x_k_indices[:, None] * stride_x_row
             + (m_start + offs_m)[None, :] * stride_x_col
         )
         x_mask = k_mask[:, None] & m_mask[None, :]
@@ -1078,12 +1174,14 @@ def grouped_gemm_up_backward(
     tokens_per_expert: torch.Tensor,
     hidden_size: int,
     activation: str = "relu_squared",
+    gather_map: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Backward pass for grouped_gemm_up.
 
     Args:
         grad_output: Gradient w.r.t. activated output [total_tokens, max_expert_width]
-        x: Original input [total_tokens, hidden_size]
+        x: Original input. If gather_map is None: [total_tokens, hidden_size] (gathered).
+            If gather_map is provided: [num_tokens, hidden_size] (original order).
         w1: Up-projection weights [hidden_size, total_expert_width]
         pre_act: Pre-activation values from forward [total_tokens, max_expert_width]
             For relu_squared: relu(z) where z = x @ W1
@@ -1093,15 +1191,19 @@ def grouped_gemm_up_backward(
         tokens_per_expert: Token counts per expert [num_experts]
         hidden_size: Hidden dimension
         activation: Activation function used in forward
+        gather_map: Optional [total_padded] int32 mapping gathered row -> original row.
+            When provided, dw kernel reads x via gather_map (avoids storing x_gathered).
 
     Returns:
-        grad_x: Gradient w.r.t. input [total_tokens, hidden_size]
+        grad_x: Gradient w.r.t. input [total_tokens, hidden_size] (in gathered space)
         grad_w1: Gradient w.r.t. weights [hidden_size, total_expert_width]
     """
-    total_tokens = x.shape[0]
+    total_tokens = expert_token_offsets[-1].item()
     num_experts = len(expert_widths)
     device = x.device
     dtype = x.dtype
+
+    use_gather_map = gather_map is not None
 
     activation_code = {"none": 0, "relu_squared": 1, "swiglu": 2}.get(activation, 0)
 
@@ -1147,6 +1249,12 @@ def grouped_gemm_up_backward(
         ACTIVATION=activation_code,
     )
 
+    # Dummy gather_map pointer when not using fused gather
+    if not use_gather_map:
+        gather_map_for_kernel = expert_token_offsets  # Won't be read
+    else:
+        gather_map_for_kernel = gather_map
+
     # For grad_w1 kernel, we tile over (hidden_size, expert_width) per expert
     def grid_dw(meta):
         # Compute tiles needed for all experts using tensor ops
@@ -1159,6 +1267,7 @@ def grouped_gemm_up_backward(
         grad_output,
         pre_act,
         grad_w1,
+        gather_map_for_kernel,
         x.stride(0),
         x.stride(1),
         grad_output.stride(0),
@@ -1175,6 +1284,7 @@ def grouped_gemm_up_backward(
         hidden_size,
         num_experts,
         ACTIVATION=activation_code,
+        USE_GATHER_MAP=use_gather_map,
     )
 
     return grad_x, grad_w1
@@ -1281,7 +1391,12 @@ def grouped_gemm_down_backward(
 
 
 class GroupedGemmUp(torch.autograd.Function):
-    """Autograd function for grouped GEMM up-projection with fused activation."""
+    """Autograd function for grouped GEMM up-projection with fused activation.
+
+    When x_flat and gather_map are provided, saves x_flat + gather_map for backward
+    instead of x_gathered, avoiding keeping x_gathered alive from forward to backward.
+    This saves ~31.5MB per MoE layer at n_embd=768, bs=10.
+    """
 
     @staticmethod
     @custom_fwd(device_type="cuda")
@@ -1295,9 +1410,19 @@ class GroupedGemmUp(torch.autograd.Function):
         tokens_per_expert: torch.Tensor,
         max_expert_width: int,
         hidden_size: int,
-        activation: str = "relu_squared",
+        activation: str,
+        x_flat: torch.Tensor | None,
+        gather_map: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Forward pass - calls the Triton kernel and saves tensors for backward."""
+        """Forward pass - calls the Triton kernel and saves tensors for backward.
+
+        Args:
+            x: Gathered input [total_tokens, hidden_size]
+            x_flat: Original ungathered input [num_tokens, hidden_size].
+                When provided with gather_map, backward uses x_flat + gather_map
+                instead of x_gathered (saves ~31.5MB per layer).
+            gather_map: [total_padded] int32, maps gathered row -> original token row
+        """
         # Ensure x and w1 have same dtype for Triton kernel
         x = x.to(w1.dtype)
 
@@ -1314,15 +1439,35 @@ class GroupedGemmUp(torch.autograd.Function):
             save_pre_act=True,
         )
 
-        ctx.save_for_backward(
-            x,
-            w1,
-            pre_act,
-            expert_token_offsets,
-            expert_weight_offsets,
-            expert_widths,
-            tokens_per_expert,
-        )
+        use_gather_map = x_flat is not None and gather_map is not None
+        ctx.use_gather_map = use_gather_map
+
+        if use_gather_map:
+            # Save x_flat + gather_map instead of x_gathered for memory efficiency.
+            # x_flat is already alive (shared with rest of model), so saving it is ~free.
+            # gather_map is tiny (~80KB). This lets x_gathered be freed after forward.
+            ctx.save_for_backward(
+                x_flat,
+                w1,
+                pre_act,
+                expert_token_offsets,
+                expert_weight_offsets,
+                expert_widths,
+                tokens_per_expert,
+                gather_map,
+            )
+        else:
+            # Fallback: save x_gathered (original behavior)
+            ctx.save_for_backward(
+                x,
+                w1,
+                pre_act,
+                expert_token_offsets,
+                expert_weight_offsets,
+                expert_widths,
+                tokens_per_expert,
+            )
+
         ctx.max_expert_width = max_expert_width
         ctx.hidden_size = hidden_size
         ctx.activation = activation
@@ -1334,19 +1479,32 @@ class GroupedGemmUp(torch.autograd.Function):
     @once_differentiable
     def backward(ctx, grad_output: torch.Tensor) -> tuple:
         """Backward pass - computes gradients w.r.t. x and w1."""
-        (
-            x,
-            w1,
-            pre_act,
-            expert_token_offsets,
-            expert_weight_offsets,
-            expert_widths,
-            tokens_per_expert,
-        ) = ctx.saved_tensors
+        if ctx.use_gather_map:
+            (
+                x_for_dw,
+                w1,
+                pre_act,
+                expert_token_offsets,
+                expert_weight_offsets,
+                expert_widths,
+                tokens_per_expert,
+                gather_map,
+            ) = ctx.saved_tensors
+        else:
+            (
+                x_for_dw,
+                w1,
+                pre_act,
+                expert_token_offsets,
+                expert_weight_offsets,
+                expert_widths,
+                tokens_per_expert,
+            ) = ctx.saved_tensors
+            gather_map = None
 
         grad_x, grad_w1 = grouped_gemm_up_backward(
             grad_output,
-            x,
+            x_for_dw,
             w1,
             pre_act,
             expert_token_offsets,
@@ -1355,12 +1513,14 @@ class GroupedGemmUp(torch.autograd.Function):
             tokens_per_expert,
             ctx.hidden_size,
             ctx.activation,
+            gather_map=gather_map,
         )
 
         # Return gradients in same order as forward inputs
-        # (x, w1, expert_token_offsets, expert_weight_offsets, expert_widths,
-        #  tokens_per_expert, max_expert_width, hidden_size, activation)
-        return grad_x, grad_w1, None, None, None, None, None, None, None
+        # (x, w1, ..., x_flat, gather_map)
+        # grad_x is in gathered space → flows back through PaddedGatherOp
+        # x_flat gets None here (its gradient comes via PaddedGatherOp path)
+        return grad_x, grad_w1, None, None, None, None, None, None, None, None, None
 
 
 class GroupedGemmDown(torch.autograd.Function):
@@ -1449,10 +1609,18 @@ def grouped_gemm_up_autograd(
     max_expert_width: int,
     hidden_size: int,
     activation: str = "relu_squared",
+    x_flat: torch.Tensor | None = None,
+    gather_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Grouped GEMM up-projection with autograd support.
 
     Use this instead of grouped_gemm_up() when you need gradients.
+
+    Args:
+        x_flat: Original ungathered input [num_tokens, hidden_size]. When provided
+            along with gather_map, saves x_flat instead of x_gathered for backward,
+            reducing peak memory by ~31.5MB per MoE layer.
+        gather_map: [total_padded] int32 mapping gathered row -> original row.
     """
     return GroupedGemmUp.apply(
         x,
@@ -1464,6 +1632,8 @@ def grouped_gemm_up_autograd(
         max_expert_width,
         hidden_size,
         activation,
+        x_flat,
+        gather_map,
     )
 
 

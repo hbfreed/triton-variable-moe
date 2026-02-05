@@ -9,6 +9,7 @@ from .grouped_gemm import (
     grouped_gemm_down_backward,
     grouped_gemm_up_autograd,
     grouped_gemm_down_autograd,
+    precompute_gather_map,
     GroupedGemmUp,
     GroupedGemmDown,
 )
@@ -29,6 +30,8 @@ __all__ = [
     # Autograd wrappers
     "grouped_gemm_up_autograd",
     "grouped_gemm_down_autograd",
+    # Gather map for fused gather
+    "precompute_gather_map",
     # Autograd Function classes
     "GroupedGemmUp",
     "GroupedGemmDown",

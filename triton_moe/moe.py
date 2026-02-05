@@ -23,6 +23,7 @@ from .kernels import (
     padded_gather_autograd,
     padded_scatter,
     padded_scatter_autograd,
+    precompute_gather_map,
 )
 
 
@@ -201,11 +202,15 @@ class TritonMoEMLP(nn.Module):
         )
 
         # 4. Gather - permute tokens to expert-sorted order
+        gather_map = precompute_gather_map(
+            indices, bin_ids, bins, padded_bins, self.num_active_experts
+        )
         x_gathered = padded_gather_autograd(
             x_flat, indices, bin_ids, bins, padded_bins, self.num_active_experts
         )
 
         # 5. Up-projection with fused activation: y = relu_squared(x @ W1)
+        # Pass x_flat + gather_map so backward can use them instead of keeping x_gathered alive
         x_up = grouped_gemm_up_autograd(
             x_gathered,
             self.w1,
@@ -216,6 +221,8 @@ class TritonMoEMLP(nn.Module):
             self.max_expert_width,
             self.config.n_embd,
             activation="relu_squared",
+            x_flat=x_flat,
+            gather_map=gather_map,
         )
 
         # 6. Down-projection: y = x_up @ W2

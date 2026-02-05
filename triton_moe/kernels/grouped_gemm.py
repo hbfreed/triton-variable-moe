@@ -102,12 +102,19 @@ def _compute_tile_info(
     local_pid = pid - tiles_before
 
     # Load this expert's dimensions
+    num_tokens = tl.load(tokens_per_expert_ptr + expert_idx)
     expert_width = tl.load(expert_widths_ptr + expert_idx)
+    m_tiles = tl.cdiv(num_tokens, BLOCK_M)
     n_tiles = tl.cdiv(expert_width, BLOCK_N)
 
-    # Convert local_pid to (m_tile, n_tile) using row-major order
-    m_tile = local_pid // n_tiles
-    n_tile = local_pid % n_tiles
+    # GROUP_M swizzle for L2 cache locality
+    # Groups consecutive M-tiles to share N-tile loads in L2
+    GROUP_M: tl.constexpr = 8
+    width = GROUP_M * n_tiles
+    group_id = local_pid // width
+    group_size = tl.minimum(m_tiles - group_id * GROUP_M, GROUP_M)
+    m_tile = group_id * GROUP_M + (local_pid % group_size)
+    n_tile = (local_pid % width) // group_size
 
     m_start = m_tile * BLOCK_M
     n_start = n_tile * BLOCK_N
@@ -1452,8 +1459,8 @@ class GroupedGemmUp(torch.autograd.Function):
         # Ensure x and w1 have same dtype for Triton kernel
         x = x.to(w1.dtype)
 
-        # Don't save pre_act to keep peak memory low (allows larger batch sizes)
-        output = grouped_gemm_up(
+        # Save pre_act from forward to avoid recomputation in backward
+        output, pre_act = grouped_gemm_up(
             x,
             w1,
             expert_token_offsets,
@@ -1462,12 +1469,13 @@ class GroupedGemmUp(torch.autograd.Function):
             tokens_per_expert,
             max_expert_width,
             activation=activation,
-            save_pre_act=False,
+            save_pre_act=True,
         )
 
         ctx.save_for_backward(
             x,
             w1,
+            pre_act,
             expert_token_offsets,
             expert_weight_offsets,
             expert_widths,
@@ -1487,23 +1495,12 @@ class GroupedGemmUp(torch.autograd.Function):
         (
             x,
             w1,
+            pre_act,
             expert_token_offsets,
             expert_weight_offsets,
             expert_widths,
             tokens_per_expert,
         ) = ctx.saved_tensors
-
-        # Recompute pre_act to save memory (allows larger batch sizes)
-        pre_act = grouped_gemm_up(
-            x,
-            w1,
-            expert_token_offsets,
-            expert_weight_offsets,
-            expert_widths,
-            tokens_per_expert,
-            ctx.max_expert_width,
-            activation="none",
-        )
 
         grad_x, grad_w1 = grouped_gemm_up_backward(
             grad_output,

@@ -35,6 +35,7 @@ class TritonMoEConfig:
     num_active_experts: int = 8
     norm_topk_prob: bool = True
     block_size: int = 128
+    use_megablocks_gather_scatter: bool = False
 
 
 class TritonMoEMLP(nn.Module):

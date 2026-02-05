@@ -115,6 +115,7 @@ def _grouped_gemm_up_kernel(
     x_ptr,  # [total_tokens, hidden_size]
     w1_ptr,  # [hidden_size, total_expert_width]
     out_ptr,  # [total_tokens, max_expert_width] (padded)
+    gate_ptr,  # [total_tokens, max_expert_width] (padded) - for swiglu backward, else unused
     # Strides
     stride_x_row,
     stride_x_col,
@@ -122,6 +123,8 @@ def _grouped_gemm_up_kernel(
     stride_w1_col,
     stride_out_row,
     stride_out_col,
+    stride_gate_row,
+    stride_gate_col,
     # Expert metadata
     expert_token_offsets_ptr,  # [num_experts + 1] cumsum of tokens per expert
     expert_weight_offsets_ptr,  # [num_experts + 1] cumsum of expert widths
@@ -136,6 +139,8 @@ def _grouped_gemm_up_kernel(
     BLOCK_K: tl.constexpr,
     # Activation: 0=none, 1=relu_squared, 2=swiglu
     ACTIVATION: tl.constexpr,
+    # Whether to save gate for swiglu backward
+    SAVE_GATE: tl.constexpr,
 ):
     """Grouped GEMM for up-projection: intermediate = x @ W1
 
@@ -215,6 +220,16 @@ def _grouped_gemm_up_kernel(
     if ACTIVATION == 1:  # relu_squared
         acc = tl.where(acc > 0, acc * acc, 0.0)
     elif ACTIVATION == 2:  # swiglu: silu(gate) * up
+        # Save gate before applying activation (for backward pass)
+        if SAVE_GATE:
+            gate_col_indices = n_start + offs_n
+            gate_ptrs = (
+                gate_ptr
+                + m_indices[:, None] * stride_gate_row
+                + gate_col_indices[None, :] * stride_gate_col
+            )
+            gate_mask = m_mask[:, None] & n_mask[None, :]
+            tl.store(gate_ptrs, acc, mask=gate_mask)
         acc = (acc * tl.sigmoid(acc)) * acc_up
 
     # Store output tile [BLOCK_M, BLOCK_N]
@@ -245,7 +260,8 @@ def grouped_gemm_up(
     tokens_per_expert: torch.Tensor,
     max_expert_width: int,
     activation: str = "relu_squared",
-) -> torch.Tensor:
+    save_gate: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Grouped GEMM for up-projection with fused activation.
 
     Args:
@@ -257,9 +273,11 @@ def grouped_gemm_up(
         tokens_per_expert: Token counts per expert [num_experts]
         max_expert_width: Max expert width (for output allocation)
         activation: Activation function ("none", "relu_squared", "swiglu")
+        save_gate: If True and activation="swiglu", also return gate values for backward
 
     Returns:
-        Intermediate activations [total_tokens, max_expert_width] (padded)
+        If save_gate=False: Intermediate activations [total_tokens, max_expert_width]
+        If save_gate=True and swiglu: (output, gate) tuple
     """
     total_tokens, hidden_size = x.shape
     num_experts = len(expert_widths)
@@ -269,7 +287,16 @@ def grouped_gemm_up(
     # Allocate output
     output = torch.zeros(total_tokens, max_expert_width, device=device, dtype=dtype)
 
+    # Allocate gate buffer for swiglu backward
+    save_gate_actual = save_gate and activation == "swiglu"
+    if save_gate_actual:
+        gate = torch.zeros(total_tokens, max_expert_width, device=device, dtype=dtype)
+    else:
+        gate = output  # Dummy pointer, won't be written to
+
     if total_tokens == 0:
+        if save_gate_actual:
+            return output, gate
         return output
 
     activation_code = {"none": 0, "relu_squared": 1, "swiglu": 2}.get(activation, 0)
@@ -287,12 +314,15 @@ def grouped_gemm_up(
         x,
         w1,
         output,
+        gate,
         x.stride(0),
         x.stride(1),
         w1.stride(0),
         w1.stride(1),
         output.stride(0),
         output.stride(1),
+        gate.stride(0),
+        gate.stride(1),
         expert_token_offsets,
         expert_weight_offsets,
         tokens_per_expert,
@@ -300,8 +330,11 @@ def grouped_gemm_up(
         hidden_size,
         num_experts,
         ACTIVATION=activation_code,
+        SAVE_GATE=save_gate_actual,
     )
 
+    if save_gate_actual:
+        return output, gate
     return output
 
 
@@ -542,7 +575,8 @@ def grouped_gemm_down(
 def _grouped_gemm_up_backward_dx_kernel(
     # Pointers
     grad_output_ptr,  # [total_tokens, max_expert_width] - gradient of activated output
-    output_ptr,  # [total_tokens, max_expert_width] - activated output (relu_squared result)
+    output_ptr,  # [total_tokens, max_expert_width] - activated output
+    gate_ptr,  # [total_tokens, max_expert_width] - gate values (for swiglu), else unused
     w1_ptr,  # [hidden_size, total_expert_width]
     grad_x_ptr,  # [total_tokens, hidden_size] - output
     # Strides
@@ -550,6 +584,8 @@ def _grouped_gemm_up_backward_dx_kernel(
     stride_grad_out_col,
     stride_output_row,
     stride_output_col,
+    stride_gate_row,
+    stride_gate_col,
     stride_w1_row,
     stride_w1_col,
     stride_grad_x_row,
@@ -566,12 +602,13 @@ def _grouped_gemm_up_backward_dx_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    # Activation: 0=none, 1=relu_squared
+    # Activation: 0=none, 1=relu_squared, 2=swiglu
     ACTIVATION: tl.constexpr,
 ):
     """Backward kernel for grad_x = grad_act @ W1.T
 
-    For relu_squared: grad_act = grad_output * 2 * pre_act * (pre_act > 0)
+    For relu_squared: grad_act = grad_output * 2 * sqrt(output)
+    For swiglu: grad_x = grad_gate @ W1_gate.T + grad_up @ W1_up.T
 
     Tiles over (M=tokens, N=hidden_size), loops over K=expert_width.
     """
@@ -618,38 +655,105 @@ def _grouped_gemm_up_backward_dx_kernel(
         grad_out_mask = m_mask[:, None] & k_mask[None, :]
         grad_out_tile = tl.load(grad_out_ptrs, mask=grad_out_mask, other=0.0)
 
-        # Apply activation derivative
-        # For relu_squared: output = relu(z)^2, so z = sqrt(output) when output > 0
-        # d/dz[relu(z)^2] = 2*z = 2*sqrt(output)
+        # Apply activation derivative and accumulate grad_x
+        grad_out_f32 = grad_out_tile.to(tl.float32)
+
         if ACTIVATION == 1:  # relu_squared
+            # output = relu(z)^2, so z = sqrt(output) when output > 0
+            # d/dz[relu(z)^2] = 2*z = 2*sqrt(output)
             output_ptrs = (
                 output_ptr
                 + m_indices[:, None] * stride_output_row
                 + k_indices[None, :] * stride_output_col
             )
             output_tile = tl.load(output_ptrs, mask=grad_out_mask, other=0.0)
-            # Cast to float32 for sqrt, then back to original dtype
             output_f32 = output_tile.to(tl.float32)
-            grad_out_f32 = grad_out_tile.to(tl.float32)
             grad_act_tile = tl.where(
                 output_f32 > 0, grad_out_f32 * 2.0 * tl.sqrt(output_f32), 0.0
             )
-        else:
-            grad_act_tile = grad_out_tile.to(tl.float32)
 
-        # Load W1.T tile: W1 is [hidden_size, total_expert_width], we need [expert_width, hidden_size]
-        # W1.T[k, n] = W1[n, weight_col_start + k]
-        w1_col_indices = weight_col_start + k_indices
-        w1_ptrs = (
-            w1_ptr
-            + (n_start + offs_n)[:, None] * stride_w1_row
-            + w1_col_indices[None, :] * stride_w1_col
-        )
-        w_mask = n_mask[:, None] & k_mask[None, :]
-        w1_tile_t = tl.load(w1_ptrs, mask=w_mask, other=0.0).to(tl.float32)  # [BLOCK_N, BLOCK_K]
+            # Load W1.T tile and accumulate
+            w1_col_indices = weight_col_start + k_indices
+            w1_ptrs = (
+                w1_ptr
+                + (n_start + offs_n)[:, None] * stride_w1_row
+                + w1_col_indices[None, :] * stride_w1_col
+            )
+            w_mask = n_mask[:, None] & k_mask[None, :]
+            w1_tile_t = tl.load(w1_ptrs, mask=w_mask, other=0.0).to(tl.float32)
+            acc += tl.dot(grad_act_tile, tl.trans(w1_tile_t))
 
-        # grad_x += grad_act @ W1.T
-        acc += tl.dot(grad_act_tile, tl.trans(w1_tile_t))
+        elif ACTIVATION == 2:  # swiglu
+            # output = silu(gate) * up, where silu(x) = x * sigmoid(x)
+            # grad_gate = grad_output * silu'(gate) * up
+            # grad_up = grad_output * silu(gate)
+            # grad_x = grad_gate @ W1_gate.T + grad_up @ W1_up.T
+
+            # Load gate values
+            gate_ptrs = (
+                gate_ptr
+                + m_indices[:, None] * stride_gate_row
+                + k_indices[None, :] * stride_gate_col
+            )
+            gate_tile = tl.load(gate_ptrs, mask=grad_out_mask, other=0.0).to(tl.float32)
+
+            # Load output values
+            output_ptrs = (
+                output_ptr
+                + m_indices[:, None] * stride_output_row
+                + k_indices[None, :] * stride_output_col
+            )
+            output_tile = tl.load(output_ptrs, mask=grad_out_mask, other=0.0).to(tl.float32)
+
+            # Compute silu(gate) and silu'(gate)
+            sigmoid_gate = tl.sigmoid(gate_tile)
+            silu_gate = gate_tile * sigmoid_gate
+            # silu'(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+            silu_prime = sigmoid_gate * (1.0 + gate_tile * (1.0 - sigmoid_gate))
+
+            # Compute up = output / silu(gate), with numerical stability
+            eps = 1e-6
+            up = tl.where(tl.abs(silu_gate) > eps, output_tile / silu_gate, 0.0)
+
+            # Compute activation gradients
+            grad_gate_tile = grad_out_f32 * silu_prime * up
+            grad_up_tile = grad_out_f32 * silu_gate
+
+            # Load W1_gate.T and accumulate grad_gate @ W1_gate.T
+            w1_gate_col_indices = weight_col_start + k_indices
+            w1_gate_ptrs = (
+                w1_ptr
+                + (n_start + offs_n)[:, None] * stride_w1_row
+                + w1_gate_col_indices[None, :] * stride_w1_col
+            )
+            w_mask = n_mask[:, None] & k_mask[None, :]
+            w1_gate_tile_t = tl.load(w1_gate_ptrs, mask=w_mask, other=0.0).to(tl.float32)
+            acc += tl.dot(grad_gate_tile, tl.trans(w1_gate_tile_t))
+
+            # Load W1_up.T and accumulate grad_up @ W1_up.T
+            # W1_up columns are offset by expert_width from W1_gate
+            w1_up_col_indices = weight_col_start + expert_width + k_indices
+            w1_up_ptrs = (
+                w1_ptr
+                + (n_start + offs_n)[:, None] * stride_w1_row
+                + w1_up_col_indices[None, :] * stride_w1_col
+            )
+            w1_up_tile_t = tl.load(w1_up_ptrs, mask=w_mask, other=0.0).to(tl.float32)
+            acc += tl.dot(grad_up_tile, tl.trans(w1_up_tile_t))
+
+        else:  # no activation
+            grad_act_tile = grad_out_f32
+
+            # Load W1.T tile and accumulate
+            w1_col_indices = weight_col_start + k_indices
+            w1_ptrs = (
+                w1_ptr
+                + (n_start + offs_n)[:, None] * stride_w1_row
+                + w1_col_indices[None, :] * stride_w1_col
+            )
+            w_mask = n_mask[:, None] & k_mask[None, :]
+            w1_tile_t = tl.load(w1_ptrs, mask=w_mask, other=0.0).to(tl.float32)
+            acc += tl.dot(grad_act_tile, tl.trans(w1_tile_t))
 
     # Store grad_x
     grad_x_col_indices = n_start + offs_n
@@ -709,6 +813,7 @@ def _grouped_gemm_up_backward_dw_kernel(
     x_ptr,  # [total_tokens, hidden_size]
     grad_output_ptr,  # [total_tokens, max_expert_width]
     output_ptr,  # [total_tokens, max_expert_width] - activated output
+    gate_ptr,  # [total_tokens, max_expert_width] - gate values (for swiglu), else unused
     grad_w1_ptr,  # [hidden_size, total_expert_width] - output
     # Strides
     stride_x_row,
@@ -717,6 +822,8 @@ def _grouped_gemm_up_backward_dw_kernel(
     stride_grad_out_col,
     stride_output_row,
     stride_output_col,
+    stride_gate_row,
+    stride_gate_col,
     stride_grad_w1_row,
     stride_grad_w1_col,
     # Expert metadata
@@ -737,6 +844,7 @@ def _grouped_gemm_up_backward_dw_kernel(
 ):
     """Backward kernel for grad_W1 = x.T @ grad_act
 
+    For swiglu: grad_W1_gate = x.T @ grad_gate, grad_W1_up = x.T @ grad_up
     Tiles over (M=hidden_size, N=expert_width), loops over K=tokens.
     Each expert's weight gradient is independent.
     """
@@ -760,6 +868,8 @@ def _grouped_gemm_up_backward_dw_kernel(
     expert_width = tl.load(expert_widths_ptr + expert_idx)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    if ACTIVATION == 2:  # swiglu needs two accumulators
+        acc_up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     offs_m = tl.arange(0, BLOCK_M)  # hidden_size dimension
     offs_n = tl.arange(0, BLOCK_N)  # expert_width dimension
@@ -792,10 +902,9 @@ def _grouped_gemm_up_backward_dw_kernel(
         )
         grad_out_mask = k_mask[:, None] & n_mask[None, :]
         grad_out_tile = tl.load(grad_out_ptrs, mask=grad_out_mask, other=0.0)
+        grad_out_f32 = grad_out_tile.to(tl.float32)
 
         # Apply activation derivative
-        # For relu_squared: output = relu(z)^2, so z = sqrt(output) when output > 0
-        # d/dz[relu(z)^2] = 2*z = 2*sqrt(output)
         if ACTIVATION == 1:  # relu_squared
             output_ptrs = (
                 output_ptr
@@ -803,27 +912,72 @@ def _grouped_gemm_up_backward_dw_kernel(
                 + grad_col_indices[None, :] * stride_output_col
             )
             output_tile = tl.load(output_ptrs, mask=grad_out_mask, other=0.0)
-            # Cast to float32 for sqrt
             output_f32 = output_tile.to(tl.float32)
-            grad_out_f32 = grad_out_tile.to(tl.float32)
             grad_act_tile = tl.where(
                 output_f32 > 0, grad_out_f32 * 2.0 * tl.sqrt(output_f32), 0.0
             )
-        else:
-            grad_act_tile = grad_out_tile.to(tl.float32)
+            acc += tl.dot(tl.trans(x_tile), grad_act_tile)
 
-        # grad_W1 += x.T @ grad_act
-        acc += tl.dot(tl.trans(x_tile), grad_act_tile)
+        elif ACTIVATION == 2:  # swiglu
+            # Load gate values
+            gate_ptrs = (
+                gate_ptr
+                + k_indices[:, None] * stride_gate_row
+                + grad_col_indices[None, :] * stride_gate_col
+            )
+            gate_tile = tl.load(gate_ptrs, mask=grad_out_mask, other=0.0).to(tl.float32)
 
-    # Store grad_W1
+            # Load output values
+            output_ptrs = (
+                output_ptr
+                + k_indices[:, None] * stride_output_row
+                + grad_col_indices[None, :] * stride_output_col
+            )
+            output_tile = tl.load(output_ptrs, mask=grad_out_mask, other=0.0).to(tl.float32)
+
+            # Compute silu(gate) and silu'(gate)
+            sigmoid_gate = tl.sigmoid(gate_tile)
+            silu_gate = gate_tile * sigmoid_gate
+            silu_prime = sigmoid_gate * (1.0 + gate_tile * (1.0 - sigmoid_gate))
+
+            # Compute up = output / silu(gate), with numerical stability
+            eps = 1e-6
+            up = tl.where(tl.abs(silu_gate) > eps, output_tile / silu_gate, 0.0)
+
+            # Compute activation gradients
+            grad_gate_tile = grad_out_f32 * silu_prime * up
+            grad_up_tile = grad_out_f32 * silu_gate
+
+            # grad_W1_gate += x.T @ grad_gate
+            acc += tl.dot(tl.trans(x_tile), grad_gate_tile)
+            # grad_W1_up += x.T @ grad_up
+            acc_up += tl.dot(tl.trans(x_tile), grad_up_tile)
+
+        else:  # no activation
+            grad_act_tile = grad_out_f32
+            acc += tl.dot(tl.trans(x_tile), grad_act_tile)
+
+    # Store grad_W1 (and grad_W1_up for swiglu)
+    out_mask = m_mask[:, None] & n_mask[None, :]
+
+    # Store grad_W1_gate (or grad_W1 for non-swiglu)
     w1_col_indices = weight_col_start + n_start + offs_n
     grad_w1_ptrs = (
         grad_w1_ptr
         + (m_start + offs_m)[:, None] * stride_grad_w1_row
         + w1_col_indices[None, :] * stride_grad_w1_col
     )
-    out_mask = m_mask[:, None] & n_mask[None, :]
     tl.store(grad_w1_ptrs, acc, mask=out_mask)
+
+    # For swiglu, also store grad_W1_up
+    if ACTIVATION == 2:
+        w1_up_col_indices = weight_col_start + expert_width + n_start + offs_n
+        grad_w1_up_ptrs = (
+            grad_w1_ptr
+            + (m_start + offs_m)[:, None] * stride_grad_w1_row
+            + w1_up_col_indices[None, :] * stride_grad_w1_col
+        )
+        tl.store(grad_w1_up_ptrs, acc_up, mask=out_mask)
 
 
 @triton.autotune(
@@ -1105,6 +1259,7 @@ def grouped_gemm_up_backward(
     tokens_per_expert: torch.Tensor,
     hidden_size: int,
     activation: str = "relu_squared",
+    gate: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Backward pass for grouped_gemm_up.
 
@@ -1119,6 +1274,7 @@ def grouped_gemm_up_backward(
         tokens_per_expert: Token counts per expert [num_experts]
         hidden_size: Hidden dimension
         activation: Activation function used in forward
+        gate: Gate values for swiglu backward [total_tokens, max_expert_width], None for other activations
 
     Returns:
         grad_x: Gradient w.r.t. input [total_tokens, hidden_size]
@@ -1130,6 +1286,13 @@ def grouped_gemm_up_backward(
     dtype = x.dtype
 
     activation_code = {"none": 0, "relu_squared": 1, "swiglu": 2}.get(activation, 0)
+
+    # For swiglu, gate is required
+    if activation == "swiglu" and gate is None:
+        raise ValueError("gate tensor required for swiglu backward")
+
+    # Use output as dummy gate pointer for non-swiglu (won't be read)
+    gate_tensor = gate if gate is not None else output
 
     # Allocate outputs
     grad_x = torch.zeros(total_tokens, hidden_size, device=device, dtype=dtype)
@@ -1154,12 +1317,15 @@ def grouped_gemm_up_backward(
     _grouped_gemm_up_backward_dx_kernel[grid_dx](
         grad_output,
         output,
+        gate_tensor,
         w1,
         grad_x,
         grad_output.stride(0),
         grad_output.stride(1),
         output.stride(0),
         output.stride(1),
+        gate_tensor.stride(0),
+        gate_tensor.stride(1),
         w1.stride(0),
         w1.stride(1),
         grad_x.stride(0),
@@ -1184,6 +1350,7 @@ def grouped_gemm_up_backward(
         x,
         grad_output,
         output,
+        gate_tensor,
         grad_w1,
         x.stride(0),
         x.stride(1),
@@ -1191,6 +1358,8 @@ def grouped_gemm_up_backward(
         grad_output.stride(1),
         output.stride(0),
         output.stride(1),
+        gate_tensor.stride(0),
+        gate_tensor.stride(1),
         grad_w1.stride(0),
         grad_w1.stride(1),
         expert_token_offsets,
@@ -1327,7 +1496,10 @@ class GroupedGemmUp(torch.autograd.Function):
         # Ensure x and w1 have same dtype for Triton kernel
         x = x.to(w1.dtype)
 
-        output = grouped_gemm_up(
+        # For swiglu, we need to save gate values for backward
+        is_swiglu = activation == "swiglu"
+
+        result = grouped_gemm_up(
             x,
             w1,
             expert_token_offsets,
@@ -1336,10 +1508,18 @@ class GroupedGemmUp(torch.autograd.Function):
             tokens_per_expert,
             max_expert_width,
             activation=activation,
+            save_gate=is_swiglu,
         )
 
-        # Save output for backward - we can derive activation gradient from output
-        # directly using sqrt(output) for relu_squared, avoiding recomputation
+        if is_swiglu:
+            output, gate = result
+        else:
+            output = result
+            gate = None
+
+        # Save tensors for backward
+        # For relu_squared: derive gradient from output using sqrt(output)
+        # For swiglu: use saved gate values
         ctx.save_for_backward(
             x,
             w1,
@@ -1348,9 +1528,11 @@ class GroupedGemmUp(torch.autograd.Function):
             expert_weight_offsets,
             expert_widths,
             tokens_per_expert,
+            gate if gate is not None else torch.empty(0, device=x.device),
         )
         ctx.hidden_size = hidden_size
         ctx.activation = activation
+        ctx.is_swiglu = is_swiglu
 
         return output
 
@@ -1367,10 +1549,15 @@ class GroupedGemmUp(torch.autograd.Function):
             expert_weight_offsets,
             expert_widths,
             tokens_per_expert,
+            gate_or_empty,
         ) = ctx.saved_tensors
 
-        # No recomputation needed! We derive activation gradient from output:
+        # Get gate tensor for swiglu, None otherwise
+        gate = gate_or_empty if ctx.is_swiglu else None
+
+        # No recomputation needed! We derive activation gradient from saved tensors:
         # For relu_squared: d/dz[relu(z)^2] = 2*z = 2*sqrt(output) when output > 0
+        # For swiglu: use saved gate to compute silu(gate), silu'(gate), and up
         grad_x, grad_w1 = grouped_gemm_up_backward(
             grad_output,
             x,
@@ -1382,6 +1569,7 @@ class GroupedGemmUp(torch.autograd.Function):
             tokens_per_expert,
             ctx.hidden_size,
             ctx.activation,
+            gate=gate,
         )
 
         # Return gradients in same order as forward inputs

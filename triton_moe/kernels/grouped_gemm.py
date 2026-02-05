@@ -33,6 +33,28 @@ from torch.amp import custom_bwd, custom_fwd
 from torch.autograd.function import once_differentiable
 
 
+def _autotune_configs():
+    """Generate expanded autotune configs for grouped GEMM kernels."""
+    configs = []
+    for BLOCK_M in [64, 128]:
+        for BLOCK_N in [64, 128]:
+            for BLOCK_K in [32, 64]:
+                for GROUP_M in [1, 4, 8, 16]:
+                    for num_warps in [4, 8]:
+                        for num_stages in [2, 3]:
+                            # Skip configs likely to exceed shared memory
+                            # ~2 * num_stages * (BLOCK_M*BLOCK_K + BLOCK_K*BLOCK_N) bytes
+                            smem = 2 * num_stages * (BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N)
+                            if smem > 96_000:
+                                continue
+                            configs.append(triton.Config(
+                                {"BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N,
+                                 "BLOCK_K": BLOCK_K, "GROUP_M": GROUP_M},
+                                num_stages=num_stages, num_warps=num_warps,
+                            ))
+    return configs
+
+
 @triton.jit
 def _sqrt_kernel(
     x_ptr,
@@ -70,6 +92,7 @@ def _compute_tile_info(
     num_experts,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    GROUP_M: tl.constexpr,
 ):
     """Compute (expert_idx, m_start, n_start) from program ID.
 
@@ -109,7 +132,6 @@ def _compute_tile_info(
 
     # GROUP_M swizzle for L2 cache locality
     # Groups consecutive M-tiles to share N-tile loads in L2
-    GROUP_M: tl.constexpr = 8
     width = GROUP_M * n_tiles
     group_id = local_pid // width
     group_size = tl.minimum(m_tiles - group_id * GROUP_M, GROUP_M)
@@ -123,26 +145,7 @@ def _compute_tile_info(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=8
-        ),
-    ],
+    configs=_autotune_configs(),
     key=["hidden_size", "num_experts"],
 )
 @triton.jit
@@ -173,6 +176,7 @@ def _grouped_gemm_up_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
     # Activation: 0=none, 1=relu_squared, 2=swiglu
     ACTIVATION: tl.constexpr,
     # Whether to save pre-activation values for backward
@@ -187,7 +191,7 @@ def _grouped_gemm_up_kernel(
 
     # Dynamically compute which tile this program handles
     expert_idx, m_start, n_start = _compute_tile_info(
-        pid, tokens_per_expert_ptr, expert_widths_ptr, num_experts, BLOCK_M, BLOCK_N
+        pid, tokens_per_expert_ptr, expert_widths_ptr, num_experts, BLOCK_M, BLOCK_N, GROUP_M
     )
 
     # Load expert-specific metadata
@@ -387,26 +391,7 @@ def grouped_gemm_up(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=8
-        ),
-    ],
+    configs=_autotune_configs(),
     key=["hidden_size", "num_experts"],
 )
 @triton.jit
@@ -434,6 +419,7 @@ def _grouped_gemm_down_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
 ):
     """Grouped GEMM for down-projection: output = intermediate @ W2
 
@@ -446,7 +432,7 @@ def _grouped_gemm_down_kernel(
     # For down kernel, expert_widths_ptr contains hidden_size repeated (for tile computation)
     # We compute tile info using hidden_size as the "width" dimension
     expert_idx, m_start, n_start = _compute_tile_info(
-        pid, tokens_per_expert_ptr, expert_widths_ptr, num_experts, BLOCK_M, BLOCK_N
+        pid, tokens_per_expert_ptr, expert_widths_ptr, num_experts, BLOCK_M, BLOCK_N, GROUP_M
     )
 
     # Load expert-specific metadata
@@ -579,44 +565,7 @@ def grouped_gemm_down(
 
 
 @triton.autotune(
-    configs=[
-        # BLOCK_K=32 variants
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        # BLOCK_K=64 variants
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=4
-        ),
-        # Higher warp counts for larger tiles
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=8
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=8
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=8
-        ),
-    ],
+    configs=_autotune_configs(),
     key=["hidden_size", "num_experts"],
 )
 @triton.jit
@@ -647,6 +596,7 @@ def _grouped_gemm_up_backward_dx_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
     # Activation: 0=none, 1=relu_squared, 2=swiglu
     ACTIVATION: tl.constexpr,
 ):
@@ -666,7 +616,7 @@ def _grouped_gemm_up_backward_dx_kernel(
     )
 
     expert_idx, m_start, n_start = _compute_tile_info(
-        pid, tokens_per_expert_ptr, hidden_sizes_ptr, num_experts, BLOCK_M, BLOCK_N
+        pid, tokens_per_expert_ptr, hidden_sizes_ptr, num_experts, BLOCK_M, BLOCK_N, GROUP_M
     )
 
     # Load expert metadata
@@ -766,44 +716,7 @@ def _grouped_gemm_up_backward_dx_kernel(
 
 
 @triton.autotune(
-    configs=[
-        # BLOCK_K=32 variants
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        # BLOCK_K=64 variants
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=4
-        ),
-        # Higher warp counts for larger tiles
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=8
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=8
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=8
-        ),
-    ],
+    configs=_autotune_configs(),
     key=["hidden_size", "num_experts"],
 )
 @triton.jit
@@ -835,6 +748,7 @@ def _grouped_gemm_up_backward_dw_kernel(
     BLOCK_M: tl.constexpr,  # tiles over hidden_size
     BLOCK_N: tl.constexpr,  # tiles over expert_width
     BLOCK_K: tl.constexpr,  # loops over tokens
+    GROUP_M: tl.constexpr,
     # Activation
     ACTIVATION: tl.constexpr,
 ):
@@ -850,7 +764,7 @@ def _grouped_gemm_up_backward_dw_kernel(
     # Tile over (hidden_size, expert_width) for each expert
     # M dimension = hidden_size (constant), N dimension = expert_width (varies)
     expert_idx, m_start, n_start = _compute_tile_info(
-        pid, hidden_sizes_ptr, expert_widths_ptr, num_experts, BLOCK_M, BLOCK_N
+        pid, hidden_sizes_ptr, expert_widths_ptr, num_experts, BLOCK_M, BLOCK_N, GROUP_M
     )
 
     # Actually for dW, we want to tile over (hidden_size, expert_width)
@@ -958,44 +872,7 @@ def _grouped_gemm_up_backward_dw_kernel(
 
 
 @triton.autotune(
-    configs=[
-        # BLOCK_K=32 variants
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        # BLOCK_K=64 variants
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=4
-        ),
-        # Higher warp counts for larger tiles
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=8
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=8
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=8
-        ),
-    ],
+    configs=_autotune_configs(),
     key=["hidden_size", "num_experts"],
 )
 @triton.jit
@@ -1023,6 +900,7 @@ def _grouped_gemm_down_backward_dintermediate_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
 ):
     """Backward kernel for grad_intermediate = grad_output @ W2.T
 
@@ -1031,7 +909,7 @@ def _grouped_gemm_down_backward_dintermediate_kernel(
     pid = tl.program_id(0)
 
     expert_idx, m_start, n_start = _compute_tile_info(
-        pid, tokens_per_expert_ptr, expert_widths_ptr, num_experts, BLOCK_M, BLOCK_N
+        pid, tokens_per_expert_ptr, expert_widths_ptr, num_experts, BLOCK_M, BLOCK_N, GROUP_M
     )
 
     # Load expert metadata
@@ -1090,44 +968,7 @@ def _grouped_gemm_down_backward_dintermediate_kernel(
 
 
 @triton.autotune(
-    configs=[
-        # BLOCK_K=32 variants
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        # BLOCK_K=64 variants
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=4
-        ),
-        # Higher warp counts for larger tiles
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=8
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=8
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=8
-        ),
-    ],
+    configs=_autotune_configs(),
     key=["hidden_size", "num_experts"],
 )
 @triton.jit
@@ -1156,6 +997,7 @@ def _grouped_gemm_down_backward_dw_kernel(
     BLOCK_M: tl.constexpr,  # tiles over expert_width
     BLOCK_N: tl.constexpr,  # tiles over hidden_size
     BLOCK_K: tl.constexpr,  # loops over tokens
+    GROUP_M: tl.constexpr,
 ):
     """Backward kernel for grad_W2 = intermediate.T @ grad_output
 
@@ -1166,7 +1008,7 @@ def _grouped_gemm_down_backward_dw_kernel(
     # Tile over (expert_width, hidden_size) for each expert
     # M dimension = expert_width (varies), N dimension = hidden_size (constant)
     expert_idx, m_start, n_start = _compute_tile_info(
-        pid, expert_widths_ptr, hidden_sizes_ptr, num_experts, BLOCK_M, BLOCK_N
+        pid, expert_widths_ptr, hidden_sizes_ptr, num_experts, BLOCK_M, BLOCK_N, GROUP_M
     )
 
     # Load expert metadata

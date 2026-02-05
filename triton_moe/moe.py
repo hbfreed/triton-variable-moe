@@ -34,7 +34,7 @@ class TritonMoEConfig:
     expert_sizes: list = field(default_factory=lambda: [(64, 256)])
     num_active_experts: int = 8
     norm_topk_prob: bool = True
-    block_size: int = 128
+    block_size: int = 64
     use_megablocks_gather_scatter: bool = False
 
 
